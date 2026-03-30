@@ -250,7 +250,7 @@ public:
 
     // create matrix from rotation enum
     void from_rotation(enum Rotation rotation);
-    
+
     /*
       calculate Euler angles (312 convention) for the matrix.
       See http://www.atacolorado.com/eulersequences.doc
@@ -271,9 +271,19 @@ public:
     // See: https://en.wikipedia.org/wiki/Rotation_matrix#General_rotations
     // "Rotation matrix from axis and angle"
     void        from_axis_angle(const Vector3<T> &v, T theta);
-    
+
+    //Create skew symmetric matrix given a vector,neccessary for from_angular_velocity
+    static Matrix3<T>        skew_symmetric(const Vector3<T> &v);
+    //Convert from a skew symmetric matrix to a vector
+    static Vector3<T>        skew_to_vector(const Matrix3<T> &M);
+    //Calculate angular velocity from a rotation matrix
+    static Matrix3<T>        from_angular_velocity(const Vector3<T> &M);
+
     // normalize a rotation matrix
     void        normalize(void);
+
+    //Calculate the norm of a rotation matrix
+    T           norm(void) const;
 
     // double/float conversion
     Matrix3<double> todouble(void) const {
