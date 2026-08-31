@@ -149,6 +149,14 @@ public:
      */
     virtual uint32_t available_memory(void) { return 4096; }
 
+    // Return total free heap memory and the largest contiguous free block.
+    // Platforms which cannot provide fragmentation information leave the
+    // largest block at zero rather than reporting a misleading value.
+    virtual void get_heap_info(uint32_t &free_bytes, uint32_t &largest_block_bytes) {
+        free_bytes = available_memory();
+        largest_block_bytes = 0;
+    }
+
     // attempt to trap the processor, presumably to enter an attached debugger
     virtual bool trap() const { return false; }
 

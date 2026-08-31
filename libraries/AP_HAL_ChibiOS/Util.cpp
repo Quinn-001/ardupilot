@@ -68,6 +68,15 @@ uint32_t Util::available_memory(void)
     return mem_available();
 }
 
+void Util::get_heap_info(uint32_t &free_bytes, uint32_t &largest_block_bytes)
+{
+    size_t free_size = 0;
+    size_t largest_size = 0;
+    mem_get_heap_info(&free_size, &largest_size);
+    free_bytes = uint32_t(free_size);
+    largest_block_bytes = uint32_t(largest_size);
+}
+
 /*
     Special Allocation Routines
 */
@@ -842,4 +851,3 @@ void Util::set_soft_armed(const bool b)
     palWriteLine(HAL_GPIO_PIN_nARMED, !b);
 #endif
 }
-

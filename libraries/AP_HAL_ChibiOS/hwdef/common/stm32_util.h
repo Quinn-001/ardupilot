@@ -38,6 +38,7 @@ void show_stack_usage(void);
 
 // allocation functions in malloc.c    
 size_t mem_available(void);
+void mem_get_heap_info(size_t *free_bytes, size_t *largest_block_bytes);
 void *malloc_dma(size_t size);
 void *malloc_axi_sram(size_t size);
 void *malloc_fastmem(size_t size);
@@ -196,4 +197,3 @@ void stm32_disable_cm4_core(void);
 #ifdef __cplusplus
 }
 #endif
-

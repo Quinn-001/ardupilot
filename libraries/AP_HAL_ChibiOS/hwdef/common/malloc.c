@@ -421,30 +421,60 @@ void free(void *ptr)
  */
 size_t mem_available(void)
 {
+    size_t free_bytes;
+    mem_get_heap_info(&free_bytes, NULL);
+    return free_bytes;
+}
+
+/*
+  return total available memory and the largest single allocation possible
+  from any managed heap.  Memory which has not yet been incorporated into the
+  default heap is also allocatable by the ChibiOS heap allocator.
+ */
+void mem_get_heap_info(size_t *free_bytes, size_t *largest_block_bytes)
+{
     size_t totalp = 0;
+    size_t largest = 0;
     uint8_t i;
 
     // get memory available on main heap
-    chHeapStatus(NULL, &totalp, NULL);
+    chHeapStatus(NULL, &totalp, &largest);
 
     // we also need to add in memory that is not yet allocated to the heap
-    totalp += chCoreGetStatusX();
+    const size_t core_free = chCoreGetStatusX();
+    totalp += core_free;
+    if (core_free > largest) {
+        largest = core_free;
+    }
 
     // now our own heaps
     for (i=1; i<NUM_MEMORY_REGIONS; i++) {
         size_t available = 0;
-        chHeapStatus(&heaps[i], &available, NULL);
+        size_t heap_largest = 0;
+        chHeapStatus(&heaps[i], &available, &heap_largest);
         totalp += available;
+        if (heap_largest > largest) {
+            largest = heap_largest;
+        }
     }
 
 #if DMA_RESERVE_SIZE != 0
     // and reserve DMA heap
     size_t available = 0;
-    chHeapStatus(&dma_reserve_heap, &available, NULL);
+    size_t heap_largest = 0;
+    chHeapStatus(&dma_reserve_heap, &available, &heap_largest);
     totalp += available;
+    if (heap_largest > largest) {
+        largest = heap_largest;
+    }
 #endif
 
-    return totalp;
+    if (free_bytes != NULL) {
+        *free_bytes = totalp;
+    }
+    if (largest_block_bytes != NULL) {
+        *largest_block_bytes = largest;
+    }
 }
 
 #if CH_CFG_USE_DYNAMIC == TRUE

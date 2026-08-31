@@ -38,6 +38,7 @@ public:
     }
 
     uint32_t available_memory() override;
+    void get_heap_info(uint32_t &free_bytes, uint32_t &largest_block_bytes) override;
 
     // get path to custom defaults file for AP_Param
     const char* get_custom_defaults_file() const override {
