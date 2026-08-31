@@ -133,6 +133,10 @@ public:
     // update backend
     void update();
 
+    // Give an in-process estimator a chance to release transient heap before
+    // the compass calibrator allocates its sample buffer and worker thread.
+    void prepare_for_compass_calibration();
+
     /*
       structures passed to other subsystems
      */
@@ -224,4 +228,3 @@ namespace AP {
 };
 
 #endif  // AP_EXTERNAL_AHRS_ENABLED
-

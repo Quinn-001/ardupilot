@@ -446,15 +446,11 @@ void AP_ExternalAHRS::update(void)
         nav_filter_status filterStatus {};
         get_filter_status(filterStatus);
 
-        AP::logger().WriteStreaming("EAHR", "TimeUS,Roll,Pitch,Yaw,VN,VE,VD,Lat,Lon,Alt,Flg",
-                                    "sdddnnnDUm-",
-                                    "F000000GG0-",
-                                    "QffffffLLfI",
-                                    AP_HAL::micros64(),
-                                    degrees(roll), degrees(pitch), degrees(yaw),
-                                    state.velocity.x, state.velocity.y, state.velocity.z,
-                                    state.location.lat, state.location.lng, state.location.alt*0.01,
-                                    filterStatus.value);
+        AP::logger().WriteExternalAHRSState(AP_HAL::micros64(),
+                                            degrees(roll), degrees(pitch), degrees(yaw),
+                                            state.velocity.x, state.velocity.y, state.velocity.z,
+                                            state.location.lat, state.location.lng, state.location.alt*0.01,
+                                            filterStatus.value);
 
         // @LoggerMessage: EAHV
         // @Description: External AHRS variances
@@ -470,15 +466,22 @@ void AP_ExternalAHRS::update(void)
         float velVar, posVar, hgtVar, tasVar;
         Vector3f magVar;
         if (backend != nullptr && backend->get_variances(velVar, posVar, hgtVar, magVar, tasVar)) {
-            AP::logger().WriteStreaming("EAHV", "TimeUS,Vel,Pos,Hgt,MagX,MagY,MagZ,TAS",
-                                        "Qfffffff",
-                                        AP_HAL::micros64(),
-                                        velVar, posVar, hgtVar,
-                                        magVar.x, magVar.y, magVar.z,
-                                        tasVar);
+            AP::logger().WriteExternalAHRSVariances(AP_HAL::micros64(),
+                                                    velVar, posVar, hgtVar,
+                                                    magVar.x, magVar.y, magVar.z,
+                                                    tasVar);
         }
     }
 #endif  // HAL_LOGGING_ENABLED
+}
+
+void AP_ExternalAHRS::prepare_for_compass_calibration()
+{
+#if AP_EXTERNAL_AHRS_CINS_ENABLED
+    if (cins_ptr != nullptr) {
+        cins_ptr->prepare_for_compass_calibration();
+    }
+#endif
 }
 
 // Get model/type name

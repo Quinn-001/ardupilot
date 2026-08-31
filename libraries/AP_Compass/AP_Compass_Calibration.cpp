@@ -3,6 +3,7 @@
 #include <AP_GPS/AP_GPS.h>
 #include <GCS_MAVLink/GCS.h>
 #include <AP_AHRS/AP_AHRS.h>
+#include <AP_ExternalAHRS/AP_ExternalAHRS.h>
 #include <AP_InternalError/AP_InternalError.h>
 
 #include "AP_Compass.h"
@@ -61,6 +62,16 @@ bool Compass::_start_calibration(uint8_t i, bool retry, float delay)
         return false;
     }
 #endif
+
+    if (option_set(Option::CAL_REQUIRE_GPS) &&
+        AP::gps().status() < AP_GPS::GPS_OK_FIX_2D) {
+        GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "Compass cal requires GPS lock");
+        return false;
+    }
+
+    // Do this before creating a calibrator: its first running state allocates
+    // the 300-sample buffer and the first calibrator also creates a thread.
+    AP::externalAHRS().prepare_for_compass_calibration();
     
     if (_calibrator[prio] == nullptr) {
         _calibrator[prio] = NEW_NOTHROW CompassCalibrator();
@@ -70,12 +81,6 @@ bool Compass::_start_calibration(uint8_t i, bool retry, float delay)
         }
     }
 
-    if (option_set(Option::CAL_REQUIRE_GPS)) {
-        if (AP::gps().status() < AP_GPS::GPS_OK_FIX_2D) {
-            GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "Compass cal requires GPS lock");
-            return false;
-        }
-    }
     if (!is_calibrating()) {
         AP_Notify::events.initiated_compass_cal = 1;
     }

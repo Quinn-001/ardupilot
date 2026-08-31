@@ -7,8 +7,11 @@
 #if AP_EXTERNAL_AHRS_CINS_ENABLED
 
 #include <AP_DAL/AP_DAL.h>
+#include <AP_HAL/AP_HAL.h>
+#include <AP_Logger/AP_EstimatorRuntimeLogging.h>
 #include <AP_Logger/AP_Logger.h>
-#include <GCS_MAVLink/GCS.h>
+
+extern const AP_HAL::HAL& hal;
 
 // gains tested for 5Hz GPS
 #define CINS_GAIN_GPSPOS_ATT (1.0E-5)
@@ -34,6 +37,7 @@
 // Variance gain for health checking
 #define CINS_VAR_LOWPASS (0.01) // low pass of measurement errors
 #define CINS_VAR_SCALE (2.) // accept measurements with normalised variance smaller than this
+#define CINS_BARO_OFFSET_SAMPLES 5
 
 /*
   CINS is very fast, but stack hungry, using Os keeps stack usage down
@@ -171,6 +175,60 @@ const AP_Param::GroupInfo AP_CINS::var_info[] = {
     // @User: Advanced
     AP_GROUPINFO("VARSC", 18, AP_CINS, gains.variance_scale, CINS_VAR_SCALE),
 
+    // @Param: GPMOD
+    // @DisplayName: CINS GPS correction scheduling mode
+    // @Description: Selects held IMU-rate or experimental fresh-sample GPS position and velocity correction
+    // @Values: 0:Held measurement at IMU rate,1:Fresh GPS sample only
+    // @User: Advanced
+    AP_GROUPINFO("GPMOD", 19, AP_CINS, gains.gps_correction_mode, 0),
+
+    // @Param: LOGR
+    // @DisplayName: CINS detail logging rate
+    // @Description: Rate for CINS and CIN2 detail records. Runtime and event summaries retain their independent one-Hz reporting. Set to zero to disable CINS detail records.
+    // @Range: 0 400
+    // @Units: Hz
+    // @User: Advanced
+    AP_GROUPINFO("LOGR", 20, AP_CINS, detail_log_rate, 10),
+
+    // @Param: MEMR
+    // @DisplayName: CINS memory diagnostic logging rate
+    // @Description: Rate for CIMD heap diagnostics. The record contains total free heap, largest contiguous free block, and CINS state flags. Set to zero to disable it.
+    // @Range: 0 20
+    // @Units: Hz
+    // @User: Advanced
+    AP_GROUPINFO("MEMR", 21, AP_CINS, memory_log_rate, 0),
+
+    // @Param: BAMOD
+    // @DisplayName: CINS barometer composite mode
+    // @Description: Selects the experimental GPS north/east plus barometric down position measurement. The update remains scheduled by new GPS samples and falls back to the unchanged GPS vector until the barometer is time-aligned, datum-aligned, healthy, and inside the consistency gate.
+    // @Values: 0:Disabled,1:Composite position vector
+    // @User: Advanced
+    AP_GROUPINFO("BAMOD", 22, AP_CINS, baro_config.mode, 0),
+
+    // @Param: BALAG
+    // @DisplayName: CINS barometer lag
+    // @Description: Estimated delay between the physical pressure measurement and its barometer timestamp. This is used with GPLAG to select a barometer sample representing the same time as the delayed GPS position.
+    // @Range: 0.0 0.2
+    // @Units: s
+    // @User: Advanced
+    AP_GROUPINFO("BALAG", 23, AP_CINS, baro_config.lag, 0.0),
+
+    // @Param: BAAGE
+    // @DisplayName: CINS barometer maximum sample age
+    // @Description: Maximum allowed time mismatch between the selected barometer sample and the delayed GPS position measurement time. A mismatch above this value causes an unchanged GPS position update.
+    // @Range: 0.005 0.1
+    // @Units: s
+    // @User: Advanced
+    AP_GROUPINFO("BAAGE", 24, AP_CINS, baro_config.max_age, 0.05),
+
+    // @Param: BAGAT
+    // @DisplayName: CINS barometer consistency gate
+    // @Description: Maximum allowed difference between datum-aligned barometric Down and GPS Down. A larger difference causes an unchanged GPS position update. This bounds the perturbation introduced by the composite-vector method.
+    // @Range: 0.1 50.0
+    // @Units: m
+    // @User: Advanced
+    AP_GROUPINFO("BAGAT", 25, AP_CINS, baro_config.gate, 10.0),
+
     AP_GROUPEND
 };
 
@@ -204,6 +262,14 @@ void AP_CINS::init(void)
 
     delayer.YR = Gal3F::identity();
     delayer.YR_stepper = Gal3F::identity();
+    delayer.history_increment = Gal3F::identity();
+    delayer.history_increment_count = 0;
+    delayer.gps_correction_dt = 0.0;
+    delayer.gps_correction_pending = false;
+    delayer.buffer_failed = false;
+    delayer.history_released_for_compass_calibration = false;
+
+    reset_baro_composite();
 
     heapVars.I3.identity();
     heapVars.zero_vector.zero();
@@ -214,17 +280,66 @@ void AP_CINS::init(void)
     state.variances.magVar = 1.0;
     state.variances.steps_to_initialise = 100;
 }
+
+void AP_CINS::prepare_for_compass_calibration(void)
+{
+    if (delayer.history_released_for_compass_calibration) {
+        return;
+    }
+    update_baro_history();
+
+    // ObjectBuffer keeps one object of backing storage even at size zero, but
+    // this releases the CINS_MAX_HISTORY allocation before compass calibration
+    // requests its 300-sample buffer and dedicated thread stack. ArduPilot
+    // requires a reboot after compass calibration, so do not reallocate history
+    // beside the calibrator's permanently allocated thread stack.
+    if (!delayer.stamped_inputs.set_size(0)) {
+        delayer.buffer_failed = true;
+        return;
+    }
+    delayer.history_released_for_compass_calibration = true;
+}
 /*
   update function, called at loop rate
  */
 void AP_CINS::update(void)
 {
     auto &dal = AP::dal();
+    write_memory_diagnostic(dal.micros64());
+
+    if (delayer.history_released_for_compass_calibration) {
+        return;
+    }
+    update_baro_history();
+#if HAL_LOGGING_ENABLED
+    const uint64_t update_start_us = estimator_runtime_micros64();
+    static EstimatorPhaseRuntimeAccumulator init_runtime;
+    static EstimatorPhaseRuntimeAccumulator input_runtime;
+    static EstimatorPhaseRuntimeAccumulator mag_yaw_runtime;
+    static EstimatorEventRateAccumulator gps_sample_rate;
+    static EstimatorEventRateAccumulator gps_vel_correction_rate;
+    static EstimatorEventRateAccumulator gps_pos_correction_rate;
+    bool gps_sample_received = false;
+    bool gps_correction_applied = false;
+    uint32_t input_elapsed_us = 0;
+    uint64_t phase_start_us;
+#endif
 
     if (!done_yaw_init) {
+#if HAL_LOGGING_ENABLED
+        phase_start_us = estimator_runtime_micros64();
+#endif
         done_yaw_init = init_yaw();
+#if HAL_LOGGING_ENABLED
+        init_runtime.log_sample(ESTIMATOR_RUNTIME_CINS_ID,
+                                ESTIMATOR_RUNTIME_PHASE_INIT,
+                                uint32_t(estimator_runtime_micros64() - phase_start_us));
+#endif
     }
 
+#if HAL_LOGGING_ENABLED
+    phase_start_us = estimator_runtime_micros64();
+#endif
     const auto &ins = dal.ins();
 
     // Get delta angle and convert to gyro rad/s
@@ -233,6 +348,12 @@ void AP_CINS::update(void)
     float dangle_dt;
     if (!ins.get_delta_angle(gyro_index, delta_angle, dangle_dt) || dangle_dt <= 0) {
         // can't update, no delta angle
+#if HAL_LOGGING_ENABLED
+        input_elapsed_us += uint32_t(estimator_runtime_micros64() - phase_start_us);
+        input_runtime.log_sample(ESTIMATOR_RUNTIME_CINS_ID,
+                                 ESTIMATOR_RUNTIME_PHASE_INPUT,
+                                 input_elapsed_us);
+#endif
         return;
     }
     // turn delta angle into a gyro in radians/sec
@@ -243,22 +364,39 @@ void AP_CINS::update(void)
     float dvel_dt;
     if (!ins.get_delta_velocity(gyro_index, delta_velocity, dvel_dt) || dvel_dt <= 0) {
         // can't update, no delta velocity
+#if HAL_LOGGING_ENABLED
+        input_elapsed_us += uint32_t(estimator_runtime_micros64() - phase_start_us);
+        input_runtime.log_sample(ESTIMATOR_RUNTIME_CINS_ID,
+                                 ESTIMATOR_RUNTIME_PHASE_INPUT,
+                                 input_elapsed_us);
+#endif
         return;
     }
     // turn delta velocity into a accel vector
     const Vector3F accel = (delta_velocity / dvel_dt).toftype();
+#if HAL_LOGGING_ENABLED
+    input_elapsed_us += uint32_t(estimator_runtime_micros64() - phase_start_us);
+#endif
 
     if (done_yaw_init && state.have_origin) {
+#if HAL_LOGGING_ENABLED
+        const bool gps_event_mode = gains.gps_correction_mode.get() == 1;
+        gps_correction_applied = !gps_event_mode || delayer.gps_correction_pending;
+#endif
         update_imu(gyro, accel, dangle_dt);
     }
 
+#if HAL_LOGGING_ENABLED
+    phase_start_us = estimator_runtime_micros64();
+#endif
     // see if we have new GPS data
     const auto &gps = dal.gps();
     if (gps.status() >= AP_DAL_GPS::GPS_OK_FIX_3D) {
         const uint32_t last_gps_fix_ms = gps.last_message_time_ms(0);
         if (last_gps_update_ms != last_gps_fix_ms) {
             // don't allow for large gain if we lose and regain GPS
-            const float gps_dt = MIN((last_gps_fix_ms - last_gps_update_ms)*0.001, 1);
+            const float gps_dt = last_gps_update_ms == 0 ? 0.0 :
+                                 MIN((last_gps_fix_ms - last_gps_update_ms)*0.001, 1);
             last_gps_update_ms = last_gps_fix_ms;
             const auto &loc = gps.location();
             if (!state.have_origin) {
@@ -267,14 +405,60 @@ void AP_CINS::update(void)
             }
             const auto & vel = gps.velocity();
             const Vector3d pos = state.origin.get_distance_NED_double(loc);
+            Vector3F measurement_pos = pos.toftype();
+            apply_baro_composite(measurement_pos, last_gps_fix_ms);
 
-            update_gps(pos.toftype(), vel.toftype(), gps_dt);
+            update_gps(measurement_pos, vel.toftype(), gps_dt);
+#if HAL_LOGGING_ENABLED
+            gps_sample_received = true;
+#endif
         }
     }
+#if HAL_LOGGING_ENABLED
+    input_elapsed_us += uint32_t(estimator_runtime_micros64() - phase_start_us);
+    input_runtime.log_sample(ESTIMATOR_RUNTIME_CINS_ID,
+                             ESTIMATOR_RUNTIME_PHASE_INPUT,
+                             input_elapsed_us);
+#endif
 
+#if HAL_LOGGING_ENABLED
+    phase_start_us = estimator_runtime_micros64();
+#endif
     update_attitude_from_compass();
+#if HAL_LOGGING_ENABLED
+    mag_yaw_runtime.log_sample(ESTIMATOR_RUNTIME_CINS_ID,
+                               ESTIMATOR_RUNTIME_PHASE_MAG_YAW,
+                               uint32_t(estimator_runtime_micros64() - phase_start_us));
+#endif
 
-    // Write logging messages
+#if HAL_LOGGING_ENABLED
+    static EstimatorTopLevelRuntimeAccumulator top_level_runtime;
+    top_level_runtime.log_sample(ESTIMATOR_RUNTIME_CINS_ID,
+                                 uint32_t(estimator_runtime_micros64() - update_start_us));
+    if (gps_sample_received) {
+        gps_sample_rate.log_event(ESTIMATOR_RUNTIME_CINS_ID,
+                                  ESTIMATOR_EVENT_GPS_SAMPLE);
+    }
+    if (gps_correction_applied) {
+        gps_vel_correction_rate.log_event(ESTIMATOR_RUNTIME_CINS_ID,
+                                          ESTIMATOR_EVENT_GPS_VEL_CORRECTION);
+        gps_pos_correction_rate.log_event(ESTIMATOR_RUNTIME_CINS_ID,
+                                          ESTIMATOR_EVENT_GPS_POS_CORRECTION);
+    }
+#endif
+
+    // Write CINS detail messages at their own bounded rate. This deliberately
+    // does not affect estimator execution or the independent runtime/event
+    // summaries above.
+    const int16_t configured_detail_log_rate = detail_log_rate.get();
+    const uint32_t detail_log_interval_ms = configured_detail_log_rate > 0 ?
+        1000U / uint16_t(configured_detail_log_rate) : 0;
+    const uint32_t now_ms = AP_HAL::millis();
+    if (configured_detail_log_rate <= 0 ||
+        now_ms - last_detail_log_ms < detail_log_interval_ms) {
+        return;
+    }
+    last_detail_log_ms = now_ms;
 
     // @LoggerMessage: CINS
     // @Description: CINS state
@@ -296,11 +480,7 @@ void AP_CINS::update(void)
     state.XHat.rot().to_euler(&roll_rad, &pitch_rad, &yaw_rad);
     const Location loc = get_location();
 
-    AP::logger().WriteStreaming("CINS", "TimeUS,I,Roll,Pitch,Yaw,VN,VE,VD,PN,PE,PD,Lat,Lon,Alt",
-                                "s#dddnnnmmmDUm",
-                                "F-000000000GG0",
-                                "QBfffffffffLLf",
-                                dal.micros64(),
+    AP::logger().WriteCINSState(dal.micros64(),
                                 DAL_CORE(0),
                                 degrees(roll_rad),
                                 degrees(pitch_rad),
@@ -331,11 +511,7 @@ void AP_CINS::update(void)
     // @Field: APN: auxiliary position north
     // @Field: APE: auxiliary position east
     // @Field: APD: auxiliary position down
-    AP::logger().WriteStreaming("CIN2", "TimeUS,I,GX,GY,GZ,AX,AY,AZ,AVN,AVE,AVD,APN,APE,APD",
-                                "s#kkkooonnnmmm",
-                                "F-000000000000",
-                                "QBffffffffffff",
-                                dal.micros64(),
+    AP::logger().WriteCINSExtra(dal.micros64(),
                                 DAL_CORE(0),
                                 degrees(state.gyr_bias.x),
                                 degrees(state.gyr_bias.y),
@@ -351,38 +527,184 @@ void AP_CINS::update(void)
                                 state.ZHat.W2().z);
 }
 
+void AP_CINS::write_memory_diagnostic(uint64_t time_us)
+{
+#if HAL_LOGGING_ENABLED
+    const int8_t configured_rate_hz = memory_log_rate.get();
+    if (configured_rate_hz <= 0) {
+        return;
+    }
+    const uint32_t now_ms = AP_HAL::millis();
+    const uint32_t interval_ms = 1000U / uint8_t(configured_rate_hz);
+    if (now_ms - last_memory_log_ms < interval_ms) {
+        return;
+    }
+    last_memory_log_ms = now_ms;
+
+    uint32_t free_bytes;
+    uint32_t largest_block_bytes;
+    hal.util->get_heap_info(free_bytes, largest_block_bytes);
+    uint8_t flags = hal.util->get_soft_armed() ? 1U : 0U;
+    flags |= state.have_origin ? 2U : 0U;
+    flags |= done_yaw_init ? 4U : 0U;
+    flags |= delayer.buffer_failed ? 8U : 0U;
+    flags |= delayer.history_released_for_compass_calibration ? 16U : 0U;
+    flags |= baro_config.mode.get() == 1 ? 32U : 0U;
+    flags |= baro_state.offset_valid ? 64U : 0U;
+    flags |= baro_state.last_sample_accepted ? 128U : 0U;
+    AP::logger().WriteCINSMemory(time_us, free_bytes, largest_block_bytes, flags);
+#endif
+}
+
+void AP_CINS::reset_baro_composite()
+{
+    baro_state.offset = 0.0;
+    baro_state.offset_sum = 0.0;
+    baro_state.last_update_ms = 0;
+    baro_state.next = 0;
+    baro_state.count = 0;
+    baro_state.offset_sample_count = 0;
+    baro_state.primary = uint8_t(-1);
+    baro_state.healthy = false;
+    baro_state.offset_valid = false;
+    baro_state.last_sample_accepted = false;
+}
+
+void AP_CINS::update_baro_history()
+{
+    if (baro_config.mode.get() != 1) {
+        reset_baro_composite();
+        return;
+    }
+
+    const auto &barometer = AP::dal().baro();
+    const uint8_t primary = barometer.get_primary();
+    if (barometer.num_instances() == 0 || primary >= barometer.num_instances()) {
+        baro_state.healthy = false;
+        return;
+    }
+
+    if (primary != baro_state.primary) {
+        reset_baro_composite();
+        baro_state.primary = primary;
+    }
+
+    if (!barometer.healthy(primary)) {
+        baro_state.healthy = false;
+        return;
+    }
+
+    const uint32_t timestamp_ms = barometer.get_last_update(primary);
+    const float altitude = barometer.get_altitude(primary);
+    if (timestamp_ms == 0 || !isfinite(altitude)) {
+        baro_state.healthy = false;
+        return;
+    }
+    baro_state.healthy = true;
+
+    if (timestamp_ms == baro_state.last_update_ms) {
+        return;
+    }
+    baro_state.last_update_ms = timestamp_ms;
+
+    baro_state.history[baro_state.next] = { timestamp_ms, -altitude };
+    baro_state.next = (baro_state.next + 1U) % CINS_BARO_HISTORY_SIZE;
+    if (baro_state.count < CINS_BARO_HISTORY_SIZE) {
+        baro_state.count++;
+    }
+}
+
+bool AP_CINS::apply_baro_composite(Vector3F &gps_pos, uint32_t gps_timestamp_ms)
+{
+    baro_state.last_sample_accepted = false;
+    if (baro_config.mode.get() != 1 || !baro_state.healthy || baro_state.count == 0) {
+        return false;
+    }
+
+    const float gps_lag = gains.gps_lag.get();
+    const float baro_lag = baro_config.lag.get();
+    const float max_age = baro_config.max_age.get();
+    const float gate = baro_config.gate.get();
+    if (!isfinite(gps_lag) || !isfinite(baro_lag) || !isfinite(max_age) ||
+        !isfinite(gate) || gps_lag < 0.0f || gps_lag > 0.2f ||
+        baro_lag < 0.0f || baro_lag > 0.2f ||
+        max_age < 0.005f || max_age > 0.1f ||
+        gate < 0.1f || gate > 50.0f) {
+        return false;
+    }
+
+    // GPS and barometer receipt timestamps share the AP_HAL millisecond clock.
+    // Select the barometer receipt time corresponding to the GPS measurement
+    // time: t_baro = t_gps - gps_lag + baro_lag.
+    const int32_t lag_difference_ms = int32_t((baro_lag - gps_lag) * 1000.0f);
+    const uint32_t target_timestamp_ms = gps_timestamp_ms + lag_difference_ms;
+
+    uint8_t best_index = 0;
+    uint32_t best_error_ms = UINT32_MAX;
+    for (uint8_t i = 0; i < baro_state.count; i++) {
+        const uint32_t sample_time_ms = baro_state.history[i].timestamp_ms;
+        const uint32_t forward_error = sample_time_ms - target_timestamp_ms;
+        const uint32_t backward_error = target_timestamp_ms - sample_time_ms;
+        const uint32_t error_ms = MIN(forward_error, backward_error);
+        if (error_ms < best_error_ms) {
+            best_error_ms = error_ms;
+            best_index = i;
+        }
+    }
+
+    const uint32_t max_age_ms = uint32_t(max_age * 1000.0f + 0.5f);
+    if (best_error_ms > max_age_ms) {
+        return false;
+    }
+
+    const ftype raw_baro_down = baro_state.history[best_index].down;
+    if (!isfinite(raw_baro_down) || gps_pos.is_nan() || gps_pos.is_inf()) {
+        return false;
+    }
+
+    // Estimate the fixed difference between the barometer's calibrated datum
+    // and the CINS origin from paired measurements, then freeze it. No composite
+    // sample is admitted during this startup alignment interval.
+    if (!baro_state.offset_valid) {
+        baro_state.offset_sum += raw_baro_down - gps_pos.z;
+        baro_state.offset_sample_count++;
+        if (baro_state.offset_sample_count < CINS_BARO_OFFSET_SAMPLES) {
+            return false;
+        }
+        baro_state.offset = baro_state.offset_sum / baro_state.offset_sample_count;
+        baro_state.offset_valid = isfinite(baro_state.offset);
+        if (!baro_state.offset_valid) {
+            reset_baro_composite();
+            return false;
+        }
+    }
+
+    const ftype composite_down = raw_baro_down - baro_state.offset;
+    if (!isfinite(composite_down) || fabsF(composite_down - gps_pos.z) > gate) {
+        return false;
+    }
+
+    gps_pos.z = composite_down;
+    baro_state.last_sample_accepted = true;
+    return true;
+}
+
 
 /*
   update on new GPS sample
  */
 void AP_CINS::update_gps(const Vector3F &pos, const Vector3F &vel, const ftype gps_dt)
 {
-    const auto &dal = AP::dal();
-
     // Update the delayer variables. The gps vel and pos are used at every time step through the delay structure.
     delayer.YR = delayer.YR_stepper.inverse() * delayer.YR;
     delayer.YR_stepper = Gal3F::identity();
     delayer.gps_vel = vel;
     delayer.gps_pos = pos;
+    if (is_positive(gps_dt)) {
+        delayer.gps_correction_dt = gps_dt;
+        delayer.gps_correction_pending = true;
+    }
 
-    // use AHRS3 for debugging
-    ftype roll_rad, pitch_rad, yaw_rad;
-    const auto rot = state.XHat.rot() * dal.get_rotation_vehicle_body_to_autopilot_body().toftype();
-    rot.to_euler(&roll_rad, &pitch_rad, &yaw_rad);
-    const Location loc = get_location();
-    const mavlink_ahrs3_t pkt {
-roll : float(roll_rad),
-pitch : float(pitch_rad),
-yaw : float(yaw_rad),
-altitude : float(-state.XHat.pos().z),
-lat: loc.lat,
-lng: loc.lng,
-        v1 : 0,
-        v2 : 0,
-        v3 : 0,
-        v4 : 0
-    };
-    gcs().send_to_active_channels(MAVLINK_MSG_ID_AHRS3, (const char *)&pkt);
 }
 
 
@@ -391,6 +713,13 @@ lng: loc.lng,
  */
 void AP_CINS::update_imu(const Vector3F &gyro_rads, const Vector3F &accel_mss, const ftype dt)
 {
+#if HAL_LOGGING_ENABLED
+    static EstimatorPhaseRuntimeAccumulator predict_runtime;
+    static EstimatorPhaseRuntimeAccumulator delay_runtime;
+    static EstimatorPhaseRuntimeAccumulator posvel_runtime;
+    uint64_t phase_start_us = estimator_runtime_micros64();
+#endif
+
     //Integrate Dynamics using the Matrix exponential
 
     // Update the bias gain matrices
@@ -422,17 +751,55 @@ void AP_CINS::update_imu(const Vector3F &gyro_rads, const Vector3F &accel_mss, c
 
     state.ZHat = SIM23(leftMat) * state.ZHat * heapVars.GammaInv;
 
+#if HAL_LOGGING_ENABLED
+    predict_runtime.log_sample(ESTIMATOR_RUNTIME_CINS_ID,
+                               ESTIMATOR_RUNTIME_PHASE_PREDICT,
+                               uint32_t(estimator_runtime_micros64() - phase_start_us));
+    phase_start_us = estimator_runtime_micros64();
+#endif
+
     // Update the delay matrices and buffer
     delayer.YR = delayer.YR * rightMat;
     delayer.internal_time += dt;
-    delayer.stamped_inputs.push({delayer.internal_time, rightMat});
+    const uint32_t internal_time_us = uint32_t(uint64_t(delayer.internal_time * 1.0e6));
+    const uint32_t gps_lag_us = uint32_t(gains.gps_lag.get() * 1.0e6f);
+    delayer.history_increment = delayer.history_increment * rightMat;
+    if (++delayer.history_increment_count >= CINS_HISTORY_DECIMATION) {
+        stamped_Gal3F stamped_input {};
+        stamped_input.timestamp_us = internal_time_us;
+        stamped_input.rot.from_rotation_matrix(delayer.history_increment.rot());
+        stamped_input.pos = delayer.history_increment.pos();
+        stamped_input.vel = delayer.history_increment.vel();
+        stamped_input.tau = delayer.history_increment.tau();
+        if (!delayer.stamped_inputs.push(stamped_input)) {
+            delayer.buffer_failed = true;
+        }
+        delayer.history_increment = Gal3F::identity();
+        delayer.history_increment_count = 0;
+    }
 
-    struct stamped_Gal3F back;
+    stamped_Gal3F back;
     while (delayer.stamped_inputs.peek(back) &&
-           back.timestamp < delayer.internal_time - gains.gps_lag.get()) {
-        delayer.YR_stepper = delayer.YR_stepper * back.gal3;
+           uint32_t(internal_time_us - back.timestamp_us) > gps_lag_us) {
+        Matrix3F back_rot;
+        back.rot.rotation_matrix(back_rot);
+        delayer.YR_stepper = delayer.YR_stepper * Gal3F(back_rot, back.pos, back.vel, back.tau);
         delayer.stamped_inputs.pop();
     }
+
+#if HAL_LOGGING_ENABLED
+    delay_runtime.log_sample(ESTIMATOR_RUNTIME_CINS_ID,
+                             ESTIMATOR_RUNTIME_PHASE_DELAY,
+                             uint32_t(estimator_runtime_micros64() - phase_start_us));
+    phase_start_us = estimator_runtime_micros64();
+#endif
+
+    const bool gps_event_mode = gains.gps_correction_mode.get() == 1;
+    if (gps_event_mode && !delayer.gps_correction_pending) {
+        return;
+    }
+    const ftype correction_dt = gps_event_mode ? delayer.gps_correction_dt : dt;
+    delayer.gps_correction_pending = false;
 
     // Update using delayed GPS
     const ftype& current_lag = delayer.YR.tau();
@@ -443,7 +810,10 @@ void AP_CINS::update_imu(const Vector3F &gyro_rads, const Vector3F &accel_mss, c
     const Vector2F& ref_vel = Vector2F(1., 0.);
     const Vector3F& mu0_vel = YRInv.vel();
     const Vector3F mu_vel = delayer.gps_vel - left_delay_vel * ref_vel.x - left_delay_pos * ref_vel.y;
-    const ftype velErrorSq = update_vector_measurement_cts(mu_vel, mu0_vel, ref_vel, gains.gpsvel_att.get(), gains.gps_vel.get(), gains.gps_vel_gyr_bias.get(), gains.gps_vel_acc_bias.get(), dt);
+    const ftype velErrorSq = update_vector_measurement_cts(mu_vel, mu0_vel, ref_vel,
+                                                          gains.gpsvel_att.get(), gains.gps_vel.get(),
+                                                          gains.gps_vel_gyr_bias.get(), gains.gps_vel_acc_bias.get(),
+                                                          correction_dt);
     state.variances.velTest = velErrorSq / (state.variances.velVar * gains.variance_scale.get());
     state.variances.velVar =  gains.variance_lowpass.get() * velErrorSq + (1.-gains.variance_lowpass.get()) * state.variances.velVar;
 
@@ -451,7 +821,10 @@ void AP_CINS::update_imu(const Vector3F &gyro_rads, const Vector3F &accel_mss, c
     const Vector3F& mu0_pos = YRInv.pos();
     const Vector2F& ref_pos = Vector2F(-current_lag, 1.);
     const Vector3F mu_pos = delayer.gps_pos - left_delay_vel * ref_pos.x - left_delay_pos * ref_pos.y;
-    const ftype posErrorSq = update_vector_measurement_cts(mu_pos, mu0_pos, ref_pos, gains.gpspos_att.get(), gains.gps_pos.get(), gains.gps_pos_gyr_bias.get(), gains.gps_pos_acc_bias.get(), dt);
+    const ftype posErrorSq = update_vector_measurement_cts(mu_pos, mu0_pos, ref_pos,
+                                                          gains.gpspos_att.get(), gains.gps_pos.get(),
+                                                          gains.gps_pos_gyr_bias.get(), gains.gps_pos_acc_bias.get(),
+                                                          correction_dt);
     state.variances.posTest = posErrorSq / (state.variances.posVar * gains.variance_scale.get());
     state.variances.posVar =  gains.variance_lowpass.get() * posErrorSq + (1.-gains.variance_lowpass.get()) * state.variances.posVar;
 
@@ -462,6 +835,12 @@ void AP_CINS::update_imu(const Vector3F &gyro_rads, const Vector3F &accel_mss, c
     if (state.variances.steps_to_initialise > 0) {
         --state.variances.steps_to_initialise;
     }
+
+#if HAL_LOGGING_ENABLED
+    posvel_runtime.log_sample(ESTIMATOR_RUNTIME_CINS_ID,
+                              ESTIMATOR_RUNTIME_PHASE_POSVEL,
+                              uint32_t(estimator_runtime_micros64() - phase_start_us));
+#endif
 
 }
 

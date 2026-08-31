@@ -22,15 +22,20 @@
 #include "AP_ExternalAHRS_CINS.h"
 #include <GCS_MAVLink/GCS.h>
 
-// constructor
 AP_ExternalAHRS_CINS::AP_ExternalAHRS_CINS(AP_ExternalAHRS *_frontend,
                                            AP_ExternalAHRS::state_t &_state,
                                            AP_CINS *&cins_ptr) :
     AP_ExternalAHRS_backend(_frontend, _state)
 {
+    // Make the dynamically allocated CINS parameter subgroup accessible
     cins_ptr = &cins;
-    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CINS Started");
+
+    // AP_Param::load_all() ran before cins_ptr was valid, so explicitly
+    // restore the saved CINS parameters now that the object exists.
+    AP_Param::load_object_from_eeprom(&cins, AP_CINS::var_info);
+
     cins.init();
+
     // CINS does not provide new sensors, only a state estimate
     set_default_sensors(0);
 }
@@ -38,6 +43,19 @@ AP_ExternalAHRS_CINS::AP_ExternalAHRS_CINS(AP_ExternalAHRS *_frontend,
 void AP_ExternalAHRS_CINS::update(void)
 {
     cins.update();
+
+    if (!reported_running && AP_HAL::millis() >= 5000) {
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CINS backend running");
+        reported_running = true;
+    }
+    if (!reported_initialised && cins.initialised()) {
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CINS initialised");
+        reported_initialised = true;
+    }
+    if (!reported_delay_buffer_failure && cins.delay_buffer_failed()) {
+        GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "CINS delay buffer full");
+        reported_delay_buffer_failure = true;
+    }
 
     WITH_SEMAPHORE(state.sem);
 

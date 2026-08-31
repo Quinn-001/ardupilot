@@ -32,10 +32,10 @@ public:
 
     // accessors for AP_AHRS
     bool healthy(void) const override {
-        return true;
+        return cins.healthy();
     }
     bool initialised(void) const override {
-        return true;
+        return cins.initialised();
     }
     bool pre_arm_check(char *failure_msg, uint8_t failure_msg_len) const override {
         return true;
@@ -55,6 +55,9 @@ public:
 
 private:
     AP_CINS cins;
+    bool reported_running{false};
+    bool reported_initialised{false};
+    bool reported_delay_buffer_failure{false};
 };
 
 #endif  // AP_EXTERNAL_AHRS_CINS_ENABLED
