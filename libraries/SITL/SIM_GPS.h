@@ -28,6 +28,7 @@ param set SERIAL5_PROTOCOL 5
 #if AP_SIM_GPS_ENABLED
 
 #include <sys/time.h>
+#include <AP_Math/AP_Math.h>
 #include "SIM_SerialDevice.h"
 
 namespace SITL {
@@ -167,7 +168,15 @@ private:
     bool _gps_has_basestation_position;
     GPS_Data _gps_basestation_data;
 
+    struct ColoredNoiseState {
+        bool initialized;
+        Vector3f position;
+        Vector3f position_rate;
+        Vector3f velocity;
+    } colored_noise_state;
+
     void simulate_jamming(GPS_Data &d);
+    void add_colored_noise(GPS_Data &d, float dt);
 
     // get delayed data
     GPS_Data interpolate_data(const GPS_Data &d, uint32_t delay_ms);

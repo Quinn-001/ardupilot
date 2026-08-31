@@ -275,7 +275,7 @@ void GPS_UBlox::publish(const GPS_Data *d)
     pvt.velD = 1000.0f * d->speedD;
     pvt.gspeed = norm(d->speedN, d->speedE) * 1000;
     pvt.head_mot = degrees(atan2f(d->speedE, d->speedN)) * 1.0e5;
-    pvt.s_acc = velned.speed_accuracy;
+    pvt.s_acc = d->speed_acc * 1000; // m/s -> mm/s
     pvt.head_acc = 38 * 1.0e5;
     pvt.p_dop = 65535;
     memset(pvt.reserved1, '\0', ARRAY_SIZE(pvt.reserved1));

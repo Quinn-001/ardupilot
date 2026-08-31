@@ -18,6 +18,7 @@
 #include <SITL/SITL.h>
 #include <AP_InternalError/AP_InternalError.h>
 
+#include "SIM_Aircraft.h"
 #include "SIM_GPS_FILE.h"
 #include "SIM_GPS_Trimble.h"
 #include "SIM_GPS_MSP.h"
@@ -153,6 +154,67 @@ const AP_Param::GroupInfo SIM::GPSParms::var_info[] = {
     // @Bitmask: 0:UBlox GPS is F9P
     // @User: Advanced
     AP_GROUPINFO("OPTIONS",  18, GPSParms, options, 0),
+
+    // @Param: CNOISE
+    // @DisplayName: GPS colored noise enable
+    // @Description: Enable configurable colored position and velocity errors
+    // @Values: 0:Disabled, 1:Enabled
+    // @User: Advanced
+    AP_GROUPINFO("CNOISE",  19, GPSParms, colored_noise, 0),
+
+    // @Param: CPSIG
+    // @DisplayName: GPS colored position standard deviation
+    // @Description: Stationary standard deviation of the Matern 3/2 position error in NED
+    // @Units: m
+    // @Vector3Parameter: 1
+    // @User: Advanced
+    AP_GROUPINFO("CPSIG",   20, GPSParms, colored_pos_sigma, 0),
+
+    // @Param: CPTAU
+    // @DisplayName: GPS colored position timescale
+    // @Description: Matern 3/2 correlation timescale of the position error in NED
+    // @Units: s
+    // @Vector3Parameter: 1
+    // @User: Advanced
+    AP_GROUPINFO("CPTAU",   21, GPSParms, colored_pos_tau, 10),
+
+    // @Param: CPW
+    // @DisplayName: GPS white position standard deviation
+    // @Description: Per-sample white position error standard deviation in NED
+    // @Units: m
+    // @Vector3Parameter: 1
+    // @User: Advanced
+    AP_GROUPINFO("CPW",     22, GPSParms, colored_pos_white, 0),
+
+    // @Param: CVSIG
+    // @DisplayName: GPS colored velocity standard deviation
+    // @Description: Stationary standard deviation of the first-order Gauss-Markov velocity error in NED
+    // @Units: m/s
+    // @Vector3Parameter: 1
+    // @User: Advanced
+    AP_GROUPINFO("CVSIG",   23, GPSParms, colored_vel_sigma, 0),
+
+    // @Param: CVTAU
+    // @DisplayName: GPS colored velocity correlation time
+    // @Description: First-order Gauss-Markov velocity error correlation time in NED
+    // @Units: s
+    // @Vector3Parameter: 1
+    // @User: Advanced
+    AP_GROUPINFO("CVTAU",   24, GPSParms, colored_vel_tau, 1),
+
+    // @Param: VACC
+    // @DisplayName: GPS vertical accuracy
+    // @Description: Reported vertical accuracy, or a negative value to use ACC
+    // @Units: m
+    // @User: Advanced
+    AP_GROUPINFO("VACC",    25, GPSParms, vertical_accuracy, -1),
+
+    // @Param: SACC
+    // @DisplayName: GPS speed accuracy
+    // @Description: Reported speed accuracy, or a negative value to derive it from VERR
+    // @Units: m/s
+    // @User: Advanced
+    AP_GROUPINFO("SACC",    26, GPSParms, speed_accuracy, -1),
 
     AP_GROUPEND
 };
@@ -430,6 +492,102 @@ void GPS::check_backend_allocation()
     allocated_type = configured_type;
 }
 
+static void update_matern32(float dt, float sigma, float tau, float &position, float &rate)
+{
+    if (!is_positive(sigma) || !is_positive(tau)) {
+        position = 0;
+        rate = 0;
+        return;
+    }
+
+    const float lambda = 1.0f / tau;
+    const float lambda_dt = lambda * dt;
+    const float decay = expf(-lambda_dt);
+    const float f00 = decay * (1.0f + lambda_dt);
+    const float f01 = decay * dt;
+    const float f10 = -decay * lambda * lambda * dt;
+    const float f11 = decay * (1.0f - lambda_dt);
+    const float sigma_sq = sq(sigma);
+    const float rate_variance = sq(lambda) * sigma_sq;
+
+    // For the stationary covariance P=diag(sigma^2, lambda^2*sigma^2),
+    // Q=P-F*P*F' gives an exact discrete-time process-noise covariance.
+    const float q00 = MAX(0.0f, sigma_sq - (sq(f00) * sigma_sq + sq(f01) * rate_variance));
+    const float q01 = -(f00 * f10 * sigma_sq + f01 * f11 * rate_variance);
+    const float q11 = MAX(0.0f, rate_variance - (sq(f10) * sigma_sq + sq(f11) * rate_variance));
+    const float l00 = sqrtf(q00);
+    const float l10 = is_positive(l00) ? q01 / l00 : 0.0f;
+    const float l11 = sqrtf(MAX(0.0f, q11 - sq(l10)));
+    const float normal0 = Aircraft::rand_normal(0, 1);
+    const float normal1 = Aircraft::rand_normal(0, 1);
+    const float old_position = position;
+    const float old_rate = rate;
+
+    position = f00 * old_position + f01 * old_rate + l00 * normal0;
+    rate = f10 * old_position + f11 * old_rate + l10 * normal0 + l11 * normal1;
+}
+
+static void update_first_order(float dt, float sigma, float tau, float &state)
+{
+    if (!is_positive(sigma) || !is_positive(tau)) {
+        state = 0;
+        return;
+    }
+
+    const float decay = expf(-dt / tau);
+    state = decay * state + sigma * sqrtf(MAX(0.0f, 1.0f - sq(decay))) * Aircraft::rand_normal(0, 1);
+}
+
+void GPS::add_colored_noise(GPS_Data &d, float dt)
+{
+    const auto &params = _sitl->gps[instance];
+    if (!params.colored_noise) {
+        colored_noise_state = {};
+        return;
+    }
+
+    const Vector3f pos_sigma = params.colored_pos_sigma;
+    const Vector3f pos_tau = params.colored_pos_tau;
+    const Vector3f pos_white = params.colored_pos_white;
+    const Vector3f vel_sigma = params.colored_vel_sigma;
+    const Vector3f vel_tau = params.colored_vel_tau;
+
+    if (!colored_noise_state.initialized) {
+        for (uint8_t axis = 0; axis < 3; axis++) {
+            if (is_positive(pos_sigma[axis]) && is_positive(pos_tau[axis])) {
+                colored_noise_state.position[axis] = Aircraft::rand_normal(0, pos_sigma[axis]);
+                colored_noise_state.position_rate[axis] = Aircraft::rand_normal(0, pos_sigma[axis] / pos_tau[axis]);
+            }
+            if (is_positive(vel_sigma[axis]) && is_positive(vel_tau[axis])) {
+                colored_noise_state.velocity[axis] = Aircraft::rand_normal(0, vel_sigma[axis]);
+            }
+        }
+        colored_noise_state.initialized = true;
+    } else {
+        for (uint8_t axis = 0; axis < 3; axis++) {
+            update_matern32(dt, pos_sigma[axis], pos_tau[axis],
+                            colored_noise_state.position[axis], colored_noise_state.position_rate[axis]);
+            update_first_order(dt, vel_sigma[axis], vel_tau[axis], colored_noise_state.velocity[axis]);
+        }
+    }
+
+    Vector3f position_error = colored_noise_state.position;
+    for (uint8_t axis = 0; axis < 3; axis++) {
+        if (is_positive(pos_white[axis])) {
+            position_error[axis] += Aircraft::rand_normal(0, pos_white[axis]);
+        }
+    }
+
+    const double earth_rad_inv = 1.569612305760477e-7;
+    const double lng_scale_factor = earth_rad_inv / cos(radians(d.latitude));
+    d.latitude += degrees(position_error.x * earth_rad_inv);
+    d.longitude += degrees(position_error.y * lng_scale_factor);
+    d.altitude -= position_error.z;
+    d.speedN += colored_noise_state.velocity.x;
+    d.speedE += colored_noise_state.velocity.y;
+    d.speedD += colored_noise_state.velocity.z;
+}
+
 /*
   possibly send a new GPS packet
  */
@@ -484,6 +642,7 @@ void GPS::update()
         return;
     }
 
+    const float update_dt = (now_ms - last_write_update_ms) * 0.001f;
     last_write_update_ms = now_ms;
 
     struct GPS_Data d {};
@@ -503,14 +662,15 @@ void GPS::update()
     d.speedN = speedN + (velErrorNED.x * rand_float());
     d.speedE = speedE + (velErrorNED.y * rand_float());
     d.speedD = speedD + (velErrorNED.z * rand_float());
+    add_colored_noise(d, update_dt);
 
     // simulate delayed lock times
     d.have_lock = (params.enabled && now_ms >= params.lock_time*1000UL);
 
     // fill in accuracies
     d.horizontal_acc = params.accuracy;
-    d.vertical_acc = params.accuracy;
-    d.speed_acc = params.vel_err.get().xy().length();
+    d.vertical_acc = is_negative(params.vertical_accuracy) ? params.accuracy : params.vertical_accuracy;
+    d.speed_acc = is_negative(params.speed_accuracy) ? params.vel_err.get().xy().length() : params.speed_accuracy;
 
     if (params.drift_alt > 0) {
         // add slow altitude drift controlled by a slow sine wave

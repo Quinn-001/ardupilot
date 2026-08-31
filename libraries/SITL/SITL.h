@@ -338,6 +338,14 @@ public:
         AP_Int8 jam; // jamming simulation enable
         AP_Float heading_offset; // heading offset in degrees
         AP_Int32 options; // GPS options bitmask
+        AP_Int8 colored_noise; // enable colored position and velocity noise
+        AP_Vector3f colored_pos_sigma; // stationary colored position error standard deviation in NED (m)
+        AP_Vector3f colored_pos_tau; // colored position error timescale in NED (s)
+        AP_Vector3f colored_pos_white; // white position error standard deviation in NED (m)
+        AP_Vector3f colored_vel_sigma; // stationary colored velocity error standard deviation in NED (m/s)
+        AP_Vector3f colored_vel_tau; // colored velocity error correlation time in NED (s)
+        AP_Float vertical_accuracy; // reported vertical accuracy (m), negative uses accuracy
+        AP_Float speed_accuracy; // reported speed accuracy (m/s), negative uses vel_err
     };
     GPSParms gps[AP_SIM_MAX_GPS_SENSORS];
 
