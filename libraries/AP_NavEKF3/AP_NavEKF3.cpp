@@ -5,6 +5,7 @@
 #include <AP_HAL/AP_HAL.h>
 
 #include <GCS_MAVLink/GCS.h>
+#include <AP_Logger/AP_EstimatorRuntimeLogging.h>
 #include <AP_Logger/AP_Logger.h>
 #include <AP_Vehicle/AP_Vehicle_Type.h>
 #include <AP_BoardConfig/AP_BoardConfig.h>
@@ -909,6 +910,10 @@ bool NavEKF3::coreBetterScore(uint8_t new_core, uint8_t current_core) const
 */
 void NavEKF3::UpdateFilter(void)
 {
+#if HAL_LOGGING_ENABLED
+    const uint64_t update_start_us = estimator_runtime_micros64();
+#endif
+
     dal.start_frame(AP_DAL::FrameType::UpdateFilterEKF3);
 
     if (!core) {
@@ -1018,6 +1023,67 @@ void NavEKF3::UpdateFilter(void)
 
     // align position of inactive sources to ahrs
     sources.align_inactive_sources();
+
+#if HAL_LOGGING_ENABLED
+    const uint32_t update_elapsed_us = uint32_t(estimator_runtime_micros64() - update_start_us);
+    static EstimatorTopLevelRuntimeAccumulator top_level_runtime;
+    static EstimatorEventRateAccumulator gps_sample_rate;
+    static EstimatorEventRateAccumulator gps_vel_correction_rate;
+    static EstimatorEventRateAccumulator gps_pos_correction_rate;
+    uint32_t gps_sample_count = 0;
+    uint32_t gps_vel_correction_count = 0;
+    uint32_t gps_pos_correction_count = 0;
+    for (uint8_t i=0; i<num_cores; i++) {
+        uint32_t core_gps_sample_count;
+        uint32_t core_gps_vel_correction_count;
+        uint32_t core_gps_pos_correction_count;
+        core[i].drain_gps_event_counts(core_gps_sample_count,
+                                        core_gps_vel_correction_count,
+                                        core_gps_pos_correction_count);
+        gps_sample_count += core_gps_sample_count;
+        gps_vel_correction_count += core_gps_vel_correction_count;
+        gps_pos_correction_count += core_gps_pos_correction_count;
+    }
+    uint8_t event_mask = 0;
+    if (gps_sample_count > 0) {
+        event_mask |= ESTIMATOR_CYCLE_GPS_SAMPLE;
+    }
+    if (gps_vel_correction_count > 0) {
+        event_mask |= ESTIMATOR_CYCLE_GPS_VEL_CORRECTION;
+    }
+    if (gps_pos_correction_count > 0) {
+        event_mask |= ESTIMATOR_CYCLE_GPS_POS_CORRECTION;
+    }
+#if ESTIMATOR_CYCLE_RUNTIME_LOG_RATE_HZ > 0
+    static uint32_t last_cycle_runtime_log_ms;
+    const uint32_t cycle_runtime_log_interval_ms =
+        1000U / ESTIMATOR_CYCLE_RUNTIME_LOG_RATE_HZ;
+    const uint32_t now_ms = AP_HAL::millis();
+    if (now_ms - last_cycle_runtime_log_ms >= cycle_runtime_log_interval_ms) {
+        last_cycle_runtime_log_ms = now_ms;
+        AP::logger().WriteEstimatorCycleRuntime(ESTIMATOR_RUNTIME_EKF3_ID,
+                                                event_mask,
+                                                float(update_elapsed_us));
+    }
+#endif
+    top_level_runtime.log_sample(ESTIMATOR_RUNTIME_EKF3_ID,
+                                 update_elapsed_us);
+    if (gps_sample_count > 0) {
+        gps_sample_rate.log_event(ESTIMATOR_RUNTIME_EKF3_ID,
+                                  ESTIMATOR_EVENT_GPS_SAMPLE,
+                                  gps_sample_count);
+    }
+    if (gps_vel_correction_count > 0) {
+        gps_vel_correction_rate.log_event(ESTIMATOR_RUNTIME_EKF3_ID,
+                                          ESTIMATOR_EVENT_GPS_VEL_CORRECTION,
+                                          gps_vel_correction_count);
+    }
+    if (gps_pos_correction_count > 0) {
+        gps_pos_correction_rate.log_event(ESTIMATOR_RUNTIME_EKF3_ID,
+                                          ESTIMATOR_EVENT_GPS_POS_CORRECTION,
+                                          gps_pos_correction_count);
+    }
+#endif
 }
 
 /*

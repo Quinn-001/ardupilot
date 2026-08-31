@@ -1047,6 +1047,531 @@ void AP_Logger::WriteCritical(const char *name, const char *labels, const char *
     va_end(arg_list);
 }
 
+#if APM_BUILD_TYPE(APM_BUILD_Replay)
+struct PACKED log_EstimatorRuntime {
+    LOG_PACKET_HEADER;
+    uint64_t time_us;
+    uint8_t estimator_id;
+    uint32_t sample_count;
+    float mean_us;
+    float max_us;
+    float last_us;
+};
+
+struct PACKED log_EstimatorPhaseRuntime {
+    LOG_PACKET_HEADER;
+    uint64_t time_us;
+    uint8_t estimator_id;
+    uint8_t phase_id;
+    uint32_t sample_count;
+    float mean_us;
+    float max_us;
+    float last_us;
+};
+
+struct PACKED log_EstimatorEventRate {
+    LOG_PACKET_HEADER;
+    uint64_t time_us;
+    uint8_t estimator_id;
+    uint8_t event_id;
+    uint32_t event_count;
+    uint32_t elapsed_us;
+    float rate_hz;
+};
+
+struct PACKED log_EstimatorCycleRuntime {
+    LOG_PACKET_HEADER;
+    uint64_t time_us;
+    uint8_t estimator_id;
+    uint8_t event_mask;
+    float elapsed_us;
+};
+
+struct PACKED log_CINS_State {
+    LOG_PACKET_HEADER;
+    uint64_t time_us;
+    uint8_t instance;
+    float roll;
+    float pitch;
+    float yaw;
+    float vn;
+    float ve;
+    float vd;
+    float pn;
+    float pe;
+    float pd;
+    int32_t lat;
+    int32_t lon;
+    float alt;
+};
+
+struct PACKED log_CINS_Extra {
+    LOG_PACKET_HEADER;
+    uint64_t time_us;
+    uint8_t instance;
+    float gx;
+    float gy;
+    float gz;
+    float ax;
+    float ay;
+    float az;
+    float avn;
+    float ave;
+    float avd;
+    float apn;
+    float ape;
+    float apd;
+};
+
+struct PACKED log_CINS_Memory {
+    LOG_PACKET_HEADER;
+    uint64_t time_us;
+    uint32_t free_bytes;
+    uint32_t largest_block_bytes;
+    uint8_t flags;
+};
+
+struct PACKED log_ExternalAHRS_State {
+    LOG_PACKET_HEADER;
+    uint64_t time_us;
+    float roll;
+    float pitch;
+    float yaw;
+    float vn;
+    float ve;
+    float vd;
+    int32_t lat;
+    int32_t lon;
+    float alt;
+    uint32_t flags;
+};
+
+struct PACKED log_ExternalAHRS_Variances {
+    LOG_PACKET_HEADER;
+    uint64_t time_us;
+    float vel;
+    float pos;
+    float hgt;
+    float mag_x;
+    float mag_y;
+    float mag_z;
+    float tas;
+};
+
+static void write_replay_format_once(bool &format_emitted, uint8_t msg_type, uint8_t msg_len,
+                                     const char *name, const char *format, const char *labels,
+                                     const char *units_text, const char *multipliers)
+{
+    if (format_emitted) {
+        return;
+    }
+
+    struct log_Format fmt {};
+    fmt.head1 = HEAD_BYTE1;
+    fmt.head2 = HEAD_BYTE2;
+    fmt.msgid = LOG_FORMAT_MSG;
+    fmt.type = msg_type;
+    fmt.length = msg_len;
+    strncpy_noterm(fmt.name, name, sizeof(fmt.name));
+    strncpy_noterm(fmt.format, format, sizeof(fmt.format));
+    strncpy_noterm(fmt.labels, labels, sizeof(fmt.labels));
+    AP::logger().WriteCriticalBlock(&fmt, sizeof(fmt));
+
+    struct log_Format_Units units {};
+    units.head1 = HEAD_BYTE1;
+    units.head2 = HEAD_BYTE2;
+    units.msgid = LOG_FORMAT_UNITS_MSG;
+    units.time_us = AP_HAL::micros64();
+    units.format_type = msg_type;
+    strncpy_noterm(units.units, units_text, sizeof(units.units));
+    strncpy_noterm(units.multipliers, multipliers, sizeof(units.multipliers));
+    AP::logger().WriteCriticalBlock(&units, sizeof(units));
+    format_emitted = true;
+}
+#endif
+
+void AP_Logger::WriteEstimatorRuntime(uint8_t estimator_id, uint32_t sample_count, float mean_us, float max_us, float last_us)
+{
+    const uint64_t time_us = AP_HAL::micros64();
+
+#if APM_BUILD_TYPE(APM_BUILD_Replay)
+    static bool format_emitted;
+    static constexpr uint8_t runtime_msg_id = REPLAY_LOG_NEW_MSG_MIN;
+    write_replay_format_once(format_emitted, runtime_msg_id, sizeof(log_EstimatorRuntime),
+                             "ERTM", "QBIfff", "TimeUS,E,NS,Mean,Max,Last",
+                             "s#-sss", "F--FFF");
+
+    const log_EstimatorRuntime pkt {
+        LOG_PACKET_HEADER_INIT(runtime_msg_id),
+        time_us: time_us,
+        estimator_id: estimator_id,
+        sample_count: sample_count,
+        mean_us: mean_us,
+        max_us: max_us,
+        last_us: last_us,
+    };
+    WriteCriticalBlock(&pkt, sizeof(pkt));
+#else
+    // @LoggerMessage: ERTM
+    // @Description: Estimator top-level update runtime summary
+    // @Field: TimeUS: Time since system startup
+    // @Field: E: Estimator identifier, 0 is EKF3 and 1 is CINS
+    // @Field: NS: Number of samples in this summary window
+    // @Field: Mean: Mean estimator update runtime
+    // @Field: Max: Maximum estimator update runtime
+    // @Field: Last: Most recent estimator update runtime
+    Write("ERTM", "TimeUS,E,NS,Mean,Max,Last",
+          "s#-sss",
+          "F--FFF",
+          "QBIfff",
+          time_us,
+          estimator_id,
+          sample_count,
+          mean_us,
+          max_us,
+          last_us);
+#endif
+}
+
+void AP_Logger::WriteEstimatorPhaseRuntime(uint8_t estimator_id, uint8_t phase_id, uint32_t sample_count,
+                                           float mean_us, float max_us, float last_us)
+{
+    const uint64_t time_us = AP_HAL::micros64();
+
+#if APM_BUILD_TYPE(APM_BUILD_Replay)
+    static bool format_emitted;
+    static constexpr uint8_t phase_runtime_msg_id = REPLAY_LOG_NEW_MSG_MIN + 5;
+    write_replay_format_once(format_emitted, phase_runtime_msg_id, sizeof(log_EstimatorPhaseRuntime),
+                             "ERPH", "QBBIfff", "TimeUS,E,P,NS,Mean,Max,Last",
+                             "s##-sss", "F---FFF");
+
+    const log_EstimatorPhaseRuntime pkt {
+        LOG_PACKET_HEADER_INIT(phase_runtime_msg_id),
+        time_us: time_us,
+        estimator_id: estimator_id,
+        phase_id: phase_id,
+        sample_count: sample_count,
+        mean_us: mean_us,
+        max_us: max_us,
+        last_us: last_us,
+    };
+    WriteCriticalBlock(&pkt, sizeof(pkt));
+#else
+    // @LoggerMessage: ERPH
+    // @Description: Estimator phase runtime summary
+    // @Field: TimeUS: Time since system startup
+    // @Field: E: Estimator identifier, 0 is EKF3 and 1 is CINS
+    // @Field: P: Phase identifier
+    // @Field: NS: Number of samples in this summary window
+    // @Field: Mean: Mean estimator phase runtime
+    // @Field: Max: Maximum estimator phase runtime
+    // @Field: Last: Most recent estimator phase runtime
+    Write("ERPH", "TimeUS,E,P,NS,Mean,Max,Last",
+          "s##-sss",
+          "F---FFF",
+          "QBBIfff",
+          time_us,
+          estimator_id,
+          phase_id,
+          sample_count,
+          mean_us,
+          max_us,
+          last_us);
+#endif
+}
+
+void AP_Logger::WriteEstimatorEventRate(uint8_t estimator_id, uint8_t event_id, uint32_t event_count,
+                                        uint32_t elapsed_us, float rate_hz)
+{
+    const uint64_t time_us = AP_HAL::micros64();
+
+#if APM_BUILD_TYPE(APM_BUILD_Replay)
+    static bool format_emitted;
+    static constexpr uint8_t event_rate_msg_id = REPLAY_LOG_NEW_MSG_MIN + 6;
+    write_replay_format_once(format_emitted, event_rate_msg_id, sizeof(log_EstimatorEventRate),
+                             "EREV", "QBBIIf", "TimeUS,E,M,N,Dt,Rate",
+                             "s##-sz", "F---F-");
+
+    const log_EstimatorEventRate pkt {
+        LOG_PACKET_HEADER_INIT(event_rate_msg_id),
+        time_us: time_us,
+        estimator_id: estimator_id,
+        event_id: event_id,
+        event_count: event_count,
+        elapsed_us: elapsed_us,
+        rate_hz: rate_hz,
+    };
+    WriteCriticalBlock(&pkt, sizeof(pkt));
+#else
+    // @LoggerMessage: EREV
+    // @Description: Estimator event-rate summary
+    // @Field: TimeUS: Time since system startup
+    // @Field: E: Estimator identifier, 0 is EKF3 and 1 is CINS
+    // @Field: M: Event identifier
+    // @Field: N: Number of events in this summary window
+    // @Field: Dt: Duration of this summary window
+    // @Field: Rate: Event rate over this summary window
+    Write("EREV", "TimeUS,E,M,N,Dt,Rate",
+          "s##-sz",
+          "F---F-",
+          "QBBIIf",
+          time_us,
+          estimator_id,
+          event_id,
+          event_count,
+          elapsed_us,
+          rate_hz);
+#endif
+}
+
+void AP_Logger::WriteEstimatorCycleRuntime(uint8_t estimator_id, uint8_t event_mask, float elapsed_us)
+{
+    const uint64_t time_us = AP_HAL::micros64();
+
+#if APM_BUILD_TYPE(APM_BUILD_Replay)
+    static bool format_emitted;
+    static constexpr uint8_t cycle_runtime_msg_id = REPLAY_LOG_NEW_MSG_MIN + 7;
+    write_replay_format_once(format_emitted, cycle_runtime_msg_id, sizeof(log_EstimatorCycleRuntime),
+                             "ERCT", "QBBf", "TimeUS,E,M,US",
+                             "s##s", "F---");
+
+    const log_EstimatorCycleRuntime pkt {
+        LOG_PACKET_HEADER_INIT(cycle_runtime_msg_id),
+        time_us: time_us,
+        estimator_id: estimator_id,
+        event_mask: event_mask,
+        elapsed_us: elapsed_us,
+    };
+    WriteCriticalBlock(&pkt, sizeof(pkt));
+#else
+    // @LoggerMessage: ERCT
+    // @Description: Estimator per-cycle runtime sample tagged with event mask
+    // @Field: TimeUS: Time since system startup
+    // @Field: E: Estimator identifier, 0 is EKF3 and 1 is CINS
+    // @Field: M: Event bitmask, bit 0 GPS sample, bit 1 GPS velocity correction, bit 2 GPS position correction
+    // @Field: US: Estimator update runtime for this cycle
+    Write("ERCT", "TimeUS,E,M,US",
+          "s##s",
+          "F---",
+          "QBBf",
+          time_us,
+          estimator_id,
+          event_mask,
+          elapsed_us);
+#endif
+}
+
+void AP_Logger::WriteCINSState(uint64_t time_us, uint8_t instance, float roll, float pitch, float yaw,
+                               float vn, float ve, float vd, float pn, float pe, float pd,
+                               int32_t lat, int32_t lon, float alt)
+{
+#if APM_BUILD_TYPE(APM_BUILD_Replay)
+    static bool format_emitted;
+    static constexpr uint8_t cins_msg_id = REPLAY_LOG_NEW_MSG_MIN + 1;
+    write_replay_format_once(format_emitted, cins_msg_id, sizeof(log_CINS_State),
+                             "CINS", "QBfffffffffLLf",
+                             "TimeUS,I,Roll,Pitch,Yaw,VN,VE,VD,PN,PE,PD,Lat,Lon,Alt",
+                             "s#dddnnnmmmDUm", "F-000000000GG0");
+
+    const log_CINS_State pkt {
+        LOG_PACKET_HEADER_INIT(cins_msg_id),
+        time_us: time_us,
+        instance: instance,
+        roll: roll,
+        pitch: pitch,
+        yaw: yaw,
+        vn: vn,
+        ve: ve,
+        vd: vd,
+        pn: pn,
+        pe: pe,
+        pd: pd,
+        lat: lat,
+        lon: lon,
+        alt: alt,
+    };
+    WriteCriticalBlock(&pkt, sizeof(pkt));
+#else
+    WriteStreaming("CINS", "TimeUS,I,Roll,Pitch,Yaw,VN,VE,VD,PN,PE,PD,Lat,Lon,Alt",
+                   "s#dddnnnmmmDUm",
+                   "F-000000000GG0",
+                   "QBfffffffffLLf",
+                   time_us,
+                   instance,
+                   roll,
+                   pitch,
+                   yaw,
+                   vn,
+                   ve,
+                   vd,
+                   pn,
+                   pe,
+                   pd,
+                   lat,
+                   lon,
+                   alt);
+#endif
+}
+
+void AP_Logger::WriteCINSExtra(uint64_t time_us, uint8_t instance, float gx, float gy, float gz,
+                               float ax, float ay, float az, float avn, float ave, float avd,
+                               float apn, float ape, float apd)
+{
+#if APM_BUILD_TYPE(APM_BUILD_Replay)
+    static bool format_emitted;
+    static constexpr uint8_t cin2_msg_id = REPLAY_LOG_NEW_MSG_MIN + 2;
+    write_replay_format_once(format_emitted, cin2_msg_id, sizeof(log_CINS_Extra),
+                             "CIN2", "QBffffffffffff",
+                             "TimeUS,I,GX,GY,GZ,AX,AY,AZ,AVN,AVE,AVD,APN,APE,APD",
+                             "s#kkkooonnnmmm", "F-000000000000");
+
+    const log_CINS_Extra pkt {
+        LOG_PACKET_HEADER_INIT(cin2_msg_id),
+        time_us: time_us,
+        instance: instance,
+        gx: gx,
+        gy: gy,
+        gz: gz,
+        ax: ax,
+        ay: ay,
+        az: az,
+        avn: avn,
+        ave: ave,
+        avd: avd,
+        apn: apn,
+        ape: ape,
+        apd: apd,
+    };
+    WriteCriticalBlock(&pkt, sizeof(pkt));
+#else
+    WriteStreaming("CIN2", "TimeUS,I,GX,GY,GZ,AX,AY,AZ,AVN,AVE,AVD,APN,APE,APD",
+                   "s#kkkooonnnmmm",
+                   "F-000000000000",
+                   "QBffffffffffff",
+                   time_us,
+                   instance,
+                   gx,
+                   gy,
+                   gz,
+                   ax,
+                   ay,
+                   az,
+                   avn,
+                   ave,
+                   avd,
+                   apn,
+                   ape,
+                   apd);
+#endif
+}
+
+void AP_Logger::WriteCINSMemory(uint64_t time_us, uint32_t free_bytes,
+                                uint32_t largest_block_bytes, uint8_t flags)
+{
+#if APM_BUILD_TYPE(APM_BUILD_Replay)
+    static bool format_emitted;
+    static constexpr uint8_t cimd_msg_id = REPLAY_LOG_NEW_MSG_MIN + 8;
+    write_replay_format_once(format_emitted, cimd_msg_id, sizeof(log_CINS_Memory),
+                             "CIMD", "QIIB", "TimeUS,Free,Lrg,Flags", "sbb-", "F00-");
+
+    const log_CINS_Memory pkt {
+        LOG_PACKET_HEADER_INIT(cimd_msg_id),
+        time_us: time_us,
+        free_bytes: free_bytes,
+        largest_block_bytes: largest_block_bytes,
+        flags: flags,
+    };
+    WriteCriticalBlock(&pkt, sizeof(pkt));
+#else
+    WriteStreaming("CIMD", "TimeUS,Free,Lrg,Flags",
+                   "sbb-", "F00-", "QIIB",
+                   time_us, free_bytes, largest_block_bytes, flags);
+#endif
+}
+
+void AP_Logger::WriteExternalAHRSState(uint64_t time_us, float roll, float pitch, float yaw,
+                                       float vn, float ve, float vd, int32_t lat, int32_t lon,
+                                       float alt, uint32_t flags)
+{
+#if APM_BUILD_TYPE(APM_BUILD_Replay)
+    static bool format_emitted;
+    static constexpr uint8_t eahr_msg_id = REPLAY_LOG_NEW_MSG_MIN + 3;
+    write_replay_format_once(format_emitted, eahr_msg_id, sizeof(log_ExternalAHRS_State),
+                             "EAHR", "QffffffLLfI",
+                             "TimeUS,Roll,Pitch,Yaw,VN,VE,VD,Lat,Lon,Alt,Flg",
+                             "sdddnnnDUm-", "F000000GG0-");
+
+    const log_ExternalAHRS_State pkt {
+        LOG_PACKET_HEADER_INIT(eahr_msg_id),
+        time_us: time_us,
+        roll: roll,
+        pitch: pitch,
+        yaw: yaw,
+        vn: vn,
+        ve: ve,
+        vd: vd,
+        lat: lat,
+        lon: lon,
+        alt: alt,
+        flags: flags,
+    };
+    WriteCriticalBlock(&pkt, sizeof(pkt));
+#else
+    WriteStreaming("EAHR", "TimeUS,Roll,Pitch,Yaw,VN,VE,VD,Lat,Lon,Alt,Flg",
+                   "sdddnnnDUm-",
+                   "F000000GG0-",
+                   "QffffffLLfI",
+                   time_us,
+                   roll,
+                   pitch,
+                   yaw,
+                   vn,
+                   ve,
+                   vd,
+                   lat,
+                   lon,
+                   alt,
+                   flags);
+#endif
+}
+
+void AP_Logger::WriteExternalAHRSVariances(uint64_t time_us, float vel, float pos, float hgt,
+                                           float mag_x, float mag_y, float mag_z, float tas)
+{
+#if APM_BUILD_TYPE(APM_BUILD_Replay)
+    static bool format_emitted;
+    static constexpr uint8_t eahv_msg_id = REPLAY_LOG_NEW_MSG_MIN + 4;
+    write_replay_format_once(format_emitted, eahv_msg_id, sizeof(log_ExternalAHRS_Variances),
+                             "EAHV", "Qfffffff",
+                             "TimeUS,Vel,Pos,Hgt,MagX,MagY,MagZ,TAS",
+                             "s-------", "F-------");
+
+    const log_ExternalAHRS_Variances pkt {
+        LOG_PACKET_HEADER_INIT(eahv_msg_id),
+        time_us: time_us,
+        vel: vel,
+        pos: pos,
+        hgt: hgt,
+        mag_x: mag_x,
+        mag_y: mag_y,
+        mag_z: mag_z,
+        tas: tas,
+    };
+    WriteCriticalBlock(&pkt, sizeof(pkt));
+#else
+    WriteStreaming("EAHV", "TimeUS,Vel,Pos,Hgt,MagX,MagY,MagZ,TAS",
+                   "Qfffffff",
+                   time_us,
+                   vel,
+                   pos,
+                   hgt,
+                   mag_x,
+                   mag_y,
+                   mag_z,
+                   tas);
+#endif
+}
+
 void AP_Logger::WriteV(const char *name, const char *labels, const char *units, const char *mults, const char *fmt, va_list arg_list,
                        bool is_critical, bool is_streaming)
 {

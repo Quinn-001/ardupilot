@@ -537,6 +537,7 @@ void NavEKF3_core::SelectVelPosFusion()
     gpsDataToFuse = storedGPS.recall(gpsDataDelayed,imuDataDelayed.time_ms) && !waitingForGpsChecks;
 
     if (gpsDataToFuse) {
+        gps_event_sample_count++;
         CorrectGPSForAntennaOffset(gpsDataDelayed);
         // calculate innovations and variances for reporting purposes only
         CalculateVelInnovationsAndVariances(gpsDataDelayed.vel, frontend->_gpsHorizVelNoise.get(), frontend->gpsNEVelVarAccScale, gpsVelInnov, gpsVelVarInnov);
@@ -681,6 +682,14 @@ void NavEKF3_core::SelectVelPosFusion()
 
     // perform fusion
     if (fuseVelData|| fuseVelVertData || fusePosData || fuseHgtData) {
+        if (gpsDataToFuse) {
+            if (fuseVelData && frontend->sources.useVelXYSource(AP_NavEKF_Source::SourceXY::GPS, core_index)) {
+                gps_event_vel_correction_count++;
+            }
+            if (fusePosData && frontend->sources.getPosXYSource(core_index) == AP_NavEKF_Source::SourceXY::GPS) {
+                gps_event_pos_correction_count++;
+            }
+        }
         FuseVelPosNED();
         // clear the flags to prevent repeated fusion of the same data
         fuseVelData = false;

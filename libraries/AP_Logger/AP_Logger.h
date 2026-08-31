@@ -307,6 +307,25 @@ public:
     //! @deprecated Use the other signature with units and mults
     void WriteCritical(const char *name, const char *labels, const char *fmt, ...);
     void WriteCritical(const char *name, const char *labels, const char *units, const char *mults, const char *fmt, ...);
+    void WriteEstimatorRuntime(uint8_t estimator_id, uint32_t sample_count, float mean_us, float max_us, float last_us);
+    void WriteEstimatorPhaseRuntime(uint8_t estimator_id, uint8_t phase_id, uint32_t sample_count,
+                                    float mean_us, float max_us, float last_us);
+    void WriteEstimatorEventRate(uint8_t estimator_id, uint8_t event_id, uint32_t event_count,
+                                 uint32_t elapsed_us, float rate_hz);
+    void WriteEstimatorCycleRuntime(uint8_t estimator_id, uint8_t event_mask, float elapsed_us);
+    void WriteCINSState(uint64_t time_us, uint8_t instance, float roll, float pitch, float yaw,
+                        float vn, float ve, float vd, float pn, float pe, float pd,
+                        int32_t lat, int32_t lon, float alt);
+    void WriteCINSExtra(uint64_t time_us, uint8_t instance, float gx, float gy, float gz,
+                        float ax, float ay, float az, float avn, float ave, float avd,
+                        float apn, float ape, float apd);
+    void WriteCINSMemory(uint64_t time_us, uint32_t free_bytes,
+                         uint32_t largest_block_bytes, uint8_t flags);
+    void WriteExternalAHRSState(uint64_t time_us, float roll, float pitch, float yaw,
+                                float vn, float ve, float vd, int32_t lat, int32_t lon,
+                                float alt, uint32_t flags);
+    void WriteExternalAHRSVariances(uint64_t time_us, float vel, float pos, float hgt,
+                                    float mag_x, float mag_y, float mag_z, float tas);
     void WriteV(const char *name, const char *labels, const char *units, const char *mults, const char *fmt, va_list arg_list, bool is_critical=false, bool is_streaming=false);
 
     void Write_PID(uint8_t msg_type, const class AP_PIDInfo &info);

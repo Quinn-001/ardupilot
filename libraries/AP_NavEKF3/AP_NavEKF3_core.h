@@ -141,6 +141,16 @@ public:
     // The predict flag is set true when a new prediction cycle can be started
     void UpdateFilter(bool predict);
 
+    void drain_gps_event_counts(uint32_t &samples, uint32_t &vel_corrections, uint32_t &pos_corrections)
+    {
+        samples = gps_event_sample_count;
+        vel_corrections = gps_event_vel_correction_count;
+        pos_corrections = gps_event_pos_correction_count;
+        gps_event_sample_count = 0;
+        gps_event_vel_correction_count = 0;
+        gps_event_pos_correction_count = 0;
+    }
+
     // Check basic filter health metrics and return a consolidated health status
     bool healthy(void) const;
 
@@ -1165,6 +1175,9 @@ private:
     bool needEarthBodyVarReset;     // we need to reset mag earth variances at next CovariancePrediction
     bool inhibitDelAngBiasStates;   // true when IMU delta angle bias states are inactive
     bool gpsIsInUse;                // bool true when GPS data is being used to correct states estimates
+    uint32_t gps_event_sample_count; // delayed GPS samples reaching the fusion horizon
+    uint32_t gps_event_vel_correction_count; // GPS velocity fusion attempts after gating
+    uint32_t gps_event_pos_correction_count; // GPS horizontal position fusion attempts after gating
     Location EKF_origin;     // LLH origin of the NED axis system, internal only
     Location &public_origin; // LLH origin of the NED axis system, public functions
     bool validOrigin;               // true when the EKF origin is valid

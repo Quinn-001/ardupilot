@@ -4,6 +4,7 @@
 #include "AP_NavEKF3_core.h"
 #include <GCS_MAVLink/GCS.h>
 #include <AP_VisualOdom/AP_VisualOdom.h>
+#include <AP_Logger/AP_EstimatorRuntimeLogging.h>
 #include <AP_Logger/AP_Logger.h>
 #include <AP_DAL/AP_DAL.h>
 
@@ -297,6 +298,9 @@ void NavEKF3_core::InitialiseVariables()
     posErrintegral.zero();
     gpsGoodToAlign = false;
     gpsIsInUse = false;
+    gps_event_sample_count = 0;
+    gps_event_vel_correction_count = 0;
+    gps_event_pos_correction_count = 0;
     motorsArmed = false;
     prevMotorsArmed = false;
     memset(&gpsCheckStatus, 0, sizeof(gpsCheckStatus));
@@ -629,6 +633,17 @@ void NavEKF3_core::UpdateFilter(bool predict)
         return;
     }
 
+#if HAL_LOGGING_ENABLED
+    static EstimatorPhaseRuntimeAccumulator input_runtime;
+    static EstimatorPhaseRuntimeAccumulator predict_runtime;
+    static EstimatorPhaseRuntimeAccumulator covariance_runtime;
+    static EstimatorPhaseRuntimeAccumulator mag_yaw_runtime;
+    static EstimatorPhaseRuntimeAccumulator posvel_runtime;
+    static EstimatorPhaseRuntimeAccumulator other_fusion_runtime;
+    static EstimatorPhaseRuntimeAccumulator output_runtime;
+    uint64_t phase_start_us = estimator_runtime_micros64();
+#endif
+
     fill_scratch_variables();
 
     // update sensor selection (for affinity)
@@ -642,13 +657,36 @@ void NavEKF3_core::UpdateFilter(bool predict)
     // read IMU data as delta angles and velocities
     readIMUData(predict);
 
+#if HAL_LOGGING_ENABLED
+    input_runtime.log_sample(ESTIMATOR_RUNTIME_EKF3_ID,
+                             ESTIMATOR_RUNTIME_PHASE_INPUT,
+                             uint32_t(estimator_runtime_micros64() - phase_start_us));
+#endif
+
     // Run the EKF equations to estimate at the fusion time horizon if new IMU data is available in the buffer
     if (runUpdates) {
+#if HAL_LOGGING_ENABLED
+        phase_start_us = estimator_runtime_micros64();
+#endif
         // Predict states using IMU data from the delayed time horizon
         UpdateStrapdownEquationsNED();
 
+#if HAL_LOGGING_ENABLED
+        predict_runtime.log_sample(ESTIMATOR_RUNTIME_EKF3_ID,
+                                   ESTIMATOR_RUNTIME_PHASE_PREDICT,
+                                   uint32_t(estimator_runtime_micros64() - phase_start_us));
+        phase_start_us = estimator_runtime_micros64();
+#endif
+
         // Predict the covariance growth
         CovariancePrediction(nullptr);
+
+#if HAL_LOGGING_ENABLED
+        covariance_runtime.log_sample(ESTIMATOR_RUNTIME_EKF3_ID,
+                                      ESTIMATOR_RUNTIME_PHASE_COVARIANCE,
+                                      uint32_t(estimator_runtime_micros64() - phase_start_us));
+        phase_start_us = estimator_runtime_micros64();
+#endif
 
         // Run the IMU prediction step for the GSF yaw estimator algorithm
         // using IMU and optionally true airspeed data.
@@ -658,13 +696,33 @@ void NavEKF3_core::UpdateFilter(bool predict)
         // Update states using  magnetometer or external yaw sensor data
         SelectMagFusion();
 
+#if HAL_LOGGING_ENABLED
+        uint32_t mag_yaw_elapsed_us = uint32_t(estimator_runtime_micros64() - phase_start_us);
+        phase_start_us = estimator_runtime_micros64();
+#endif
+
         // Update states using GPS and altimeter data
         SelectVelPosFusion();
+
+#if HAL_LOGGING_ENABLED
+        posvel_runtime.log_sample(ESTIMATOR_RUNTIME_EKF3_ID,
+                                  ESTIMATOR_RUNTIME_PHASE_POSVEL,
+                                  uint32_t(estimator_runtime_micros64() - phase_start_us));
+        phase_start_us = estimator_runtime_micros64();
+#endif
 
         // Run the GPS velocity correction step for the GSF yaw estimator algorithm
         // and use the yaw estimate to reset the main EKF yaw if requested
         // Muat be run after SelectVelPosFusion() so that fresh GPS data is available
         runYawEstimatorCorrection();
+
+#if HAL_LOGGING_ENABLED
+        mag_yaw_elapsed_us += uint32_t(estimator_runtime_micros64() - phase_start_us);
+        mag_yaw_runtime.log_sample(ESTIMATOR_RUNTIME_EKF3_ID,
+                                   ESTIMATOR_RUNTIME_PHASE_MAG_YAW,
+                                   mag_yaw_elapsed_us);
+        phase_start_us = estimator_runtime_micros64();
+#endif
 
 #if EK3_FEATURE_BEACON_FUSION
         // Update states using range beacon data
@@ -696,10 +754,26 @@ void NavEKF3_core::UpdateFilter(bool predict)
             moveEKFOrigin();
             checkUpdateEarthField();
         }
+
+#if HAL_LOGGING_ENABLED
+        other_fusion_runtime.log_sample(ESTIMATOR_RUNTIME_EKF3_ID,
+                                        ESTIMATOR_RUNTIME_PHASE_OTHER_FUSION,
+                                        uint32_t(estimator_runtime_micros64() - phase_start_us));
+#endif
     }
+
+#if HAL_LOGGING_ENABLED
+    phase_start_us = estimator_runtime_micros64();
+#endif
 
     // Wind output forward from the fusion to output time horizon
     calcOutputStates();
+
+#if HAL_LOGGING_ENABLED
+    output_runtime.log_sample(ESTIMATOR_RUNTIME_EKF3_ID,
+                              ESTIMATOR_RUNTIME_PHASE_OUTPUT,
+                              uint32_t(estimator_runtime_micros64() - phase_start_us));
+#endif
 
     /*
       this is a check to cope with a vehicle sitting idle on the
