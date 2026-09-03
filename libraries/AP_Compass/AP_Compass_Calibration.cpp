@@ -71,7 +71,9 @@ bool Compass::_start_calibration(uint8_t i, bool retry, float delay)
 
     // Do this before creating a calibrator: its first running state allocates
     // the 300-sample buffer and the first calibrator also creates a thread.
-    AP::externalAHRS().prepare_for_compass_calibration();
+    #if AP_EXTERNAL_AHRS_ENABLED
+    	AP::externalAHRS().prepare_for_compass_calibration();
+  	#endif
     
     if (_calibrator[prio] == nullptr) {
         _calibrator[prio] = NEW_NOTHROW CompassCalibrator();
