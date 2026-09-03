@@ -432,9 +432,32 @@ void AP_CINS::update(void)
 #endif
 
 #if HAL_LOGGING_ENABLED
+    const uint32_t update_elapsed_us = uint32_t(estimator_runtime_micros64() - update_start_us);
     static EstimatorTopLevelRuntimeAccumulator top_level_runtime;
     top_level_runtime.log_sample(ESTIMATOR_RUNTIME_CINS_ID,
-                                 uint32_t(estimator_runtime_micros64() - update_start_us));
+                                 update_elapsed_us);
+#if ESTIMATOR_CYCLE_RUNTIME_LOG_RATE_HZ > 0
+    // Raw cycle records are deliberately an opt-in profiling feature: they can
+    // add substantial logger traffic on embedded targets.
+    static uint32_t last_cycle_runtime_log_ms;
+    const uint32_t cycle_runtime_log_interval_ms =
+        1000U / ESTIMATOR_CYCLE_RUNTIME_LOG_RATE_HZ;
+    const uint32_t cycle_runtime_now_ms = AP_HAL::millis();
+    if (cycle_runtime_now_ms - last_cycle_runtime_log_ms >= cycle_runtime_log_interval_ms) {
+        last_cycle_runtime_log_ms = cycle_runtime_now_ms;
+        uint8_t event_mask = 0;
+        if (gps_sample_received) {
+            event_mask |= ESTIMATOR_CYCLE_GPS_SAMPLE;
+        }
+        if (gps_correction_applied) {
+            event_mask |= ESTIMATOR_CYCLE_GPS_VEL_CORRECTION |
+                          ESTIMATOR_CYCLE_GPS_POS_CORRECTION;
+        }
+        AP::logger().WriteEstimatorCycleRuntime(ESTIMATOR_RUNTIME_CINS_ID,
+                                                event_mask,
+                                                float(update_elapsed_us));
+    }
+#endif
     if (gps_sample_received) {
         gps_sample_rate.log_event(ESTIMATOR_RUNTIME_CINS_ID,
                                   ESTIMATOR_EVENT_GPS_SAMPLE);
