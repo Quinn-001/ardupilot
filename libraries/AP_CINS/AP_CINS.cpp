@@ -184,7 +184,7 @@ const AP_Param::GroupInfo AP_CINS::var_info[] = {
 
     // @Param: LOGR
     // @DisplayName: CINS detail logging rate
-    // @Description: Rate for CINS and CIN2 detail records. Runtime and event summaries retain their independent one-Hz reporting. Set to zero to disable CINS detail records.
+    // @Description: Rate for CINS and CIN2 detail records. A nonzero value also enables CIBD composite diagnostics at the GPS sample rate. Runtime and event summaries retain their independent one-Hz reporting. Set to zero to disable CINS detail records.
     // @Range: 0 400
     // @Units: Hz
     // @User: Advanced
@@ -639,9 +639,46 @@ void AP_CINS::update_baro_history()
 
 bool AP_CINS::apply_baro_composite(Vector3F &gps_pos, uint32_t gps_timestamp_ms)
 {
+    // One diagnostic per new GPS sample, including failed alignment attempts.
+    // NaN means unavailable; Offset is the running estimate until Count reaches 5.
+    const float gps_down = gps_pos.z;
+    float raw_down = nanf("");
+    float aligned_down = nanf("");
+    uint32_t timing_error_ms = UINT32_MAX;
+    enum class Result : uint8_t {
+        Accepted = 0, Disabled = 1, Unhealthy = 2, NoHistory = 3,
+        Configuration = 4, Timing = 5, Nonfinite = 6, Aligning = 7,
+        OffsetInvalid = 8, Gate = 9,
+    };
+    const auto finish = [&](Result result) {
+#if HAL_LOGGING_ENABLED
+        if (detail_log_rate.get() > 0) {
+            const float offset = baro_state.offset_valid ? baro_state.offset :
+                (baro_state.offset_sample_count > 0 ?
+                 baro_state.offset_sum / baro_state.offset_sample_count : nanf(""));
+            AP::logger().WriteStreaming("CIBD", "TimeUS,GPSMS,GPSD,RawD,BarD,Offset,TErr,Count,Result",
+                                       "ssmmmm---", "FC0000---", "QIffffIBB",
+                                       AP::dal().micros64(), gps_timestamp_ms,
+                                       gps_down, raw_down, aligned_down, offset,
+                                       timing_error_ms, baro_state.offset_sample_count, uint8_t(result));
+        }
+#else
+        (void)gps_down;
+        (void)raw_down;
+        (void)aligned_down;
+        (void)timing_error_ms;
+#endif
+        return result == Result::Accepted;
+    };
     baro_state.last_sample_accepted = false;
-    if (baro_config.mode.get() != 1 || !baro_state.healthy || baro_state.count == 0) {
-        return false;
+    if (baro_config.mode.get() != 1) {
+        return finish(Result::Disabled);
+    }
+    if (!baro_state.healthy) {
+        return finish(Result::Unhealthy);
+    }
+    if (baro_state.count == 0) {
+        return finish(Result::NoHistory);
     }
 
     const float gps_lag = gains.gps_lag.get();
@@ -653,7 +690,7 @@ bool AP_CINS::apply_baro_composite(Vector3F &gps_pos, uint32_t gps_timestamp_ms)
         baro_lag < 0.0f || baro_lag > 0.2f ||
         max_age < 0.005f || max_age > 0.1f ||
         gate < 0.1f || gate > 50.0f) {
-        return false;
+        return finish(Result::Configuration);
     }
 
     // GPS and barometer receipt timestamps share the AP_HAL millisecond clock.
@@ -675,14 +712,19 @@ bool AP_CINS::apply_baro_composite(Vector3F &gps_pos, uint32_t gps_timestamp_ms)
         }
     }
 
+    timing_error_ms = best_error_ms;
+    raw_down = baro_state.history[best_index].down;
+    if (baro_state.offset_valid) {
+        aligned_down = raw_down - baro_state.offset;
+    }
     const uint32_t max_age_ms = uint32_t(max_age * 1000.0f + 0.5f);
     if (best_error_ms > max_age_ms) {
-        return false;
+        return finish(Result::Timing);
     }
 
     const ftype raw_baro_down = baro_state.history[best_index].down;
     if (!isfinite(raw_baro_down) || gps_pos.is_nan() || gps_pos.is_inf()) {
-        return false;
+        return finish(Result::Nonfinite);
     }
 
     // Estimate the fixed difference between the barometer's calibrated datum
@@ -692,24 +734,25 @@ bool AP_CINS::apply_baro_composite(Vector3F &gps_pos, uint32_t gps_timestamp_ms)
         baro_state.offset_sum += raw_baro_down - gps_pos.z;
         baro_state.offset_sample_count++;
         if (baro_state.offset_sample_count < CINS_BARO_OFFSET_SAMPLES) {
-            return false;
+            return finish(Result::Aligning);
         }
         baro_state.offset = baro_state.offset_sum / baro_state.offset_sample_count;
         baro_state.offset_valid = isfinite(baro_state.offset);
         if (!baro_state.offset_valid) {
             reset_baro_composite();
-            return false;
+            return finish(Result::OffsetInvalid);
         }
     }
 
     const ftype composite_down = raw_baro_down - baro_state.offset;
+    aligned_down = composite_down;
     if (!isfinite(composite_down) || fabsF(composite_down - gps_pos.z) > gate) {
-        return false;
+        return finish(Result::Gate);
     }
 
     gps_pos.z = composite_down;
     baro_state.last_sample_accepted = true;
-    return true;
+    return finish(Result::Accepted);
 }
 
 
