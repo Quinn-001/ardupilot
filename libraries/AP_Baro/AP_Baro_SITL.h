@@ -7,6 +7,7 @@
 #include <AP_Math/vectorN.h>
 
 #include <SITL/SITL.h>
+#include <SITL/SIM_BaroPropwash.h>
 
 class AP_Baro_SITL : public AP_Baro_Backend {
 public:
@@ -50,5 +51,8 @@ private:
 
     uint32_t last_drift_delta_t_ms;  // allows for integration of drift over time
     float total_alt_drift;  // integrated altitude drift in metres
+    SITL::BaroPropwash _propwash;
+    uint32_t _propwash_last_ms = 0;
+    uint32_t _propwash_log_ms = 0;
 };
 #endif  // AP_SIM_BARO_ENABLED

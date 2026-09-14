@@ -276,6 +276,10 @@ public:
         AP_Int8  freeze; // freeze baro to last recorded altitude
         AP_Int8  disable; // disable simulated barometers
         AP_Int16 delay;  // barometer data delay in ms
+        AP_Float propwash_amplitude;
+        AP_Float propwash_threshold;
+        AP_Float propwash_reference;
+        AP_Float propwash_tau;
 
         // wind coefficients
         AP_Float wcof_xp;

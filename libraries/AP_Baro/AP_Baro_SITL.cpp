@@ -4,6 +4,7 @@
 
 #include <AP_HAL/AP_HAL.h>
 #include <AP_Vehicle/AP_Vehicle_Type.h>
+#include <AP_Logger/AP_Logger.h>
 
 extern const AP_HAL::HAL& hal;
 
@@ -60,6 +61,29 @@ void AP_Baro_SITL::_timer()
     _last_sample_time = now;
 
     float sim_alt = _sitl->state.altitude;
+
+    const auto &params = _sitl->baro[_instance];
+    const float propwash_dt = _propwash_last_ms == 0 ? 0.0f : (now - _propwash_last_ms) * 0.001f;
+    _propwash_last_ms = now;
+    const float propwash_bias = _propwash.update(_sitl->throttle, params.propwash_amplitude,
+                                               params.propwash_threshold, params.propwash_reference,
+                                               params.propwash_tau, propwash_dt);
+    // Advance the physical disturbance even while sensor reporting is disabled.
+    // Freeze and sensor delay below act on the combined measurement.
+    if (!is_zero(params.propwash_amplitude.get()) && now - _propwash_log_ms >= 100) {
+        _propwash_log_ms = now;
+        // @LoggerMessage: BPWS
+        // @Description: SITL barometer motor-dependent disturbance before sensor delay and freeze
+        // @Field: TimeUS: Time since system startup
+        // @Field: I: Barometer instance
+        // @Field: Input: Mean normalized active motor command, not thrust
+        // @Field: Bias: Injected equivalent-height bias in metres
+        // @Field: TrueAlt: Simulator altitude above mean sea level in metres
+        AP::logger().Write("BPWS", "TimeUS,I,Input,Bias,TrueAlt", "QBfff",
+                           AP_HAL::micros64(), _instance, _sitl->throttle,
+                           propwash_bias, float(sim_alt));
+    }
+    sim_alt += propwash_bias;
 
     if (_sitl->baro[_instance].disable) {
         // barometer is disabled

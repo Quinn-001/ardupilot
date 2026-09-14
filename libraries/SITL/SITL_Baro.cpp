@@ -71,6 +71,32 @@ const AP_Param::GroupInfo SIM::BaroParm::var_info[] = {
     // @Description: Barometer wind coefficient direction down in SITL
     // @User: Advanced
     AP_GROUPINFO("WCF_DN",  12, SIM::BaroParm, wcof_zn, 0.0),
+    // @Param: PWASH
+    // @DisplayName: Propwash height bias
+    // @Description: Signed apparent height bias at PW_REF motor input. Positive means reduced pressure. Zero disables the model immediately. This is a motor-command proxy, not a calibrated aerodynamic model.
+    // @Units: m
+    // @Range: -20 20
+    // @User: Advanced
+    AP_GROUPINFO("PWASH", 13, SIM::BaroParm, propwash_amplitude, 0),
+    // @Param: PW_THR
+    // @DisplayName: Propwash onset threshold
+    // @Description: Mean normalized active motor command below which target bias is zero. Must be less than PW_REF. Invalid limits disable the model.
+    // @Range: 0 1
+    // @User: Advanced
+    AP_GROUPINFO("PW_THR", 14, SIM::BaroParm, propwash_threshold, 0.1),
+    // @Param: PW_REF
+    // @DisplayName: Propwash reference input
+    // @Description: Mean normalized active motor command at which bias reaches PWASH. Bias is bounded at PWASH above this input. This is not CTUN throttle or physical thrust.
+    // @Range: 0.01 1
+    // @User: Advanced
+    AP_GROUPINFO("PW_REF", 15, SIM::BaroParm, propwash_reference, 0.35),
+    // @Param: PW_TC
+    // @DisplayName: Propwash response time constant
+    // @Description: First order rise and decay time constant in simulation time. Zero or negative gives immediate response. Bias decays when motor input drops, including shutdown.
+    // @Units: s
+    // @Range: 0 10
+    // @User: Advanced
+    AP_GROUPINFO("PW_TC", 16, SIM::BaroParm, propwash_tau, 0.2),
     AP_GROUPEND
 };
 }
