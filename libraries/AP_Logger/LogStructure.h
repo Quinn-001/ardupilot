@@ -1166,6 +1166,28 @@ struct PACKED log_VER {
 // @Field: ThrOut: Throttle output
 // @Field: FailFlags: bit 0 motor failed, bit 1 motors balanced, should be 2 in normal flight
 
+// @LoggerMessage: ERST
+// @Description: Estimator discontinuity event. TimeUS is the event emission time; ResetMS is the estimator sample clock, not an exact logged-output boundary. Sequence is global across estimators and increments even if logging drops an event. Absence of events does not prove absence of resets.
+// @Field: TimeUS: Time since system startup
+// @Field: ResetMS: Estimator sample time at reset
+// @Field: Seq: Global reset event sequence, wraps at 32 bits
+// @Field: E: Estimator, 0 EKF3, 1 CINS
+// @Field: C: Estimator core, using the same identity as its state log
+// @Field: Type: 0 initialization, 1 horizontal position, 2 vertical position, 3 horizontal velocity, 4 vertical velocity, 5 attitude, 6 height datum, 7 origin, 8 primary lane switch
+// @Field: Prev: Previous primary core for lane switches, otherwise 255
+struct PACKED log_EstimatorReset {
+    LOG_PACKET_HEADER;
+    uint64_t time_us;
+    uint32_t reset_ms;
+    uint32_t sequence;
+    uint8_t estimator;
+    uint8_t core;
+    uint8_t type;
+    uint8_t previous_core;
+};
+
+static_assert(sizeof(log_EstimatorReset) == 23, "Unexpected ERST packet size");
+
 // messages for all boards
 #define LOG_COMMON_STRUCTURES \
     { LOG_FORMAT_MSG, sizeof(log_Format), \
@@ -1271,6 +1293,8 @@ LOG_STRUCTURE_FROM_VISUALODOM \
       "ADSB",  "QIiiiHHhH", "TimeUS,ICAO_address,Lat,Lng,Alt,Heading,Hor_vel,Ver_vel,Squark", "s-DUmhnn-", "F-GGCBCC-" }, \
     { LOG_EVENT_MSG, sizeof(log_Event), \
       "EV",   "QB",           "TimeUS,Id", "s-", "F-" }, \
+    { LOG_ESTIMATOR_RESET_MSG, sizeof(log_EstimatorReset), \
+      "ERST", "QIIBBBB", "TimeUS,ResetMS,Seq,E,C,Type,Prev", "ss-----", "FC-----" }, \
     { LOG_ARM_DISARM_MSG, sizeof(log_Arm_Disarm), \
       "ARM", "QBIBB", "TimeUS,ArmState,ArmChecks,Forced,Method", "s----", "F----" }, \
     { LOG_ERROR_MSG, sizeof(log_Error), \
@@ -1380,6 +1404,7 @@ enum LogMessages : uint8_t {
     LOG_IDS_FROM_FENCE,
     LOG_IDS_FROM_HAL,
 
+    LOG_ESTIMATOR_RESET_MSG,
     _LOG_LAST_MSG_
 };
 

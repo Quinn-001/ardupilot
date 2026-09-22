@@ -128,7 +128,14 @@ private:
     void update_imu(const Vector3F &gyro_rads, const Vector3F &accel_mss, const ftype dt);
     void update_gps(const Vector3F &pos, const Vector3F &vel, const ftype gps_dt);
     ftype update_vector_measurement_cts(const Vector3F &measurement, const Vector3F& reference, const Vector2F &ref_base, const ftype& gain_R, const ftype& gain_V, const ftype& gain_gyr_bias, const ftype& gain_acc_bias, const ftype dt);
-    void update_attitude_from_compass();
+    ftype update_vector_measurement_discrete(const Vector3F &measurement,const Vector3F &reference,const Vector2F &ref_base,const ftype &gain_R,const ftype &gain_V,const ftype h_requested,const uint8_t update_kind);
+	ftype update_attitude_measurement_discrete(
+    const Vector3F &measurement,
+    const Vector3F &reference,
+    const ftype &gain_R,
+    const ftype h_requested);
+	void update_Kq_discrete(const ftype h);
+	void update_attitude_from_compass();
     bool init_yaw(void);
     bool get_compass_yaw(ftype &yaw_rad, ftype &dt);
     bool get_compass_vector(Vector3F &mag_vec, Vector3F &mag_ref, ftype &dt);

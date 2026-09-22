@@ -177,8 +177,8 @@ const AP_Param::GroupInfo AP_CINS::var_info[] = {
 
     // @Param: GPMOD
     // @DisplayName: CINS GPS correction scheduling mode
-    // @Description: Selects held IMU-rate or experimental fresh-sample GPS position and velocity correction
-    // @Values: 0:Held measurement at IMU rate,1:Fresh GPS sample only
+    // @Description: Selects CINS correction mode. Mode 2 uses finite event-based GPS and magnetometer corrections.
+    // @Values: 0:Held measurement at IMU rate,1:Fresh GPS sample Euler,2:Fresh GPS finite map
     // @User: Advanced
     AP_GROUPINFO("GPMOD", 19, AP_CINS, gains.gps_correction_mode, 0),
 
@@ -380,7 +380,7 @@ void AP_CINS::update(void)
 
     if (done_yaw_init && state.have_origin) {
 #if HAL_LOGGING_ENABLED
-        const bool gps_event_mode = gains.gps_correction_mode.get() == 1;
+        const bool gps_event_mode = gains.gps_correction_mode.get() >= 1;
         gps_correction_applied = !gps_event_mode || delayer.gps_correction_pending;
 #endif
         update_imu(gyro, accel, dangle_dt);
@@ -402,6 +402,11 @@ void AP_CINS::update(void)
             if (!state.have_origin) {
                 state.have_origin = true;
                 state.origin = loc;
+
+#if HAL_LOGGING_ENABLED
+                AP::logger().WriteEstimatorReset(dal.micros64(), dal.millis(), 1, DAL_CORE(0),
+                                                AP_Logger::EstimatorReset::ORIGIN, 255);
+#endif
             }
             const auto & vel = gps.velocity();
             const Vector3d pos = state.origin.get_distance_NED_double(loc);
@@ -786,36 +791,86 @@ void AP_CINS::update_imu(const Vector3F &gyro_rads, const Vector3F &accel_mss, c
     uint64_t phase_start_us = estimator_runtime_micros64();
 #endif
 
+	const int8_t gps_mode = gains.gps_correction_mode.get();
+	const bool gps_event_mode = gps_mode >= 1;
+	const bool gps_finite_mode = gps_mode == 2;
+
     //Integrate Dynamics using the Matrix exponential
 
     // Update the bias gain matrices
     // In mathematical terms, \dot{M} = B = - Ad_{Z^{-1} \hat{X}} [I_3, 0_3; 0_3, I_3; 0_3, 0_3].
     // Here, we split B into its parts and add them to the parts of the bias gain matrix.
-    if (done_yaw_init) {
-        const SIM23 XInv_Z = SIM23(state.XHat.inverse()) * state.ZHat;
-        state.gyr_bias_gain_mat.rot += -state.XHat.rot() * dt;
-        state.gyr_bias_gain_mat.vel += Matrix3F::skew_symmetric(XInv_Z.W1()) * XInv_Z.R().transposed() * dt;
-        state.gyr_bias_gain_mat.pos += Matrix3F::skew_symmetric(XInv_Z.W2()) * XInv_Z.R().transposed() * dt;
+    // Bias-estimation sensitivity propagation is only part of the
+	// continuous/event-Euler observer. The finite DT construction
+	// (GPMOD=2) is explicitly bias-free.
+	if (!gps_finite_mode && done_yaw_init) {
+		const SIM23 XInv_Z = SIM23(state.XHat.inverse()) * state.ZHat;
 
-        // state.acc_bias_gain_mat.rot is unchanged
-        state.acc_bias_gain_mat.vel += -state.XHat.rot() * state.ZHat.A().a11() * dt;
-        state.acc_bias_gain_mat.pos += -state.XHat.rot() * state.ZHat.A().a12() * dt;
-    }
+		state.gyr_bias_gain_mat.rot += -state.XHat.rot() * dt;
+		state.gyr_bias_gain_mat.vel +=
+			Matrix3F::skew_symmetric(XInv_Z.W1()) *
+			XInv_Z.R().transposed() * dt;
+		state.gyr_bias_gain_mat.pos +=
+			Matrix3F::skew_symmetric(XInv_Z.W2()) *
+			XInv_Z.R().transposed() * dt;
 
-    const Gal3F leftMat = Gal3F::exponential(heapVars.zero_vector, heapVars.zero_vector, heapVars.gravity_vector*dt, -dt);
-    const Gal3F rightMat = Gal3F::exponential((gyro_rads-state.gyr_bias)*dt, heapVars.zero_vector, (accel_mss-state.acc_bias)*dt, dt);
-    //Update XHat (Observer Dynamics)
-    state.XHat = leftMat * state.XHat * rightMat;
+		// state.acc_bias_gain_mat.rot is unchanged
+		state.acc_bias_gain_mat.vel +=
+			-state.XHat.rot() * state.ZHat.A().a11() * dt;
+		state.acc_bias_gain_mat.pos +=
+			-state.XHat.rot() * state.ZHat.A().a12() * dt;
+	}
 
-    //Update ZHat (Auxilary Dynamics)
-    heapVars.GammaInv = SIM23::identity();
-    const GL2 S_Gamma = 0.5 * state.ZHat.A().transposed() * GL2(gains.Q11.get(), 0., 0., gains.Q22.get()) * state.ZHat.A();
-    heapVars.GammaInv.A() = GL2::identity() - dt * S_Gamma;
+    const Gal3F leftMat =
+    Gal3F::exponential(
+        heapVars.zero_vector,
+        heapVars.zero_vector,
+        heapVars.gravity_vector * dt,
+        -dt);
 
-    // Update the bias gain with Gamma
-    compute_bias_update_imu(heapVars.GammaInv.inverse());
+	// GPMOD=2 is the bias-free finite construction.
+	// Continuous/event-Euler modes retain the original bias estimator.
+	const Vector3F gyro_input =
+		gps_finite_mode ? gyro_rads : (gyro_rads - state.gyr_bias);
 
-    state.ZHat = SIM23(leftMat) * state.ZHat * heapVars.GammaInv;
+	const Vector3F accel_input =
+		gps_finite_mode ? accel_mss : (accel_mss - state.acc_bias);
+
+	const Gal3F rightMat =
+		Gal3F::exponential(
+			gyro_input * dt,
+			heapVars.zero_vector,
+			accel_input * dt,
+			dt);
+
+	// Update XHat (Observer Dynamics)
+	state.XHat = leftMat * state.XHat * rightMat;
+
+    // Update ZHat (Auxiliary Dynamics)
+	// const bool gps_finite_mode = gains.gps_correction_mode.get() == 2;
+
+	if (gps_finite_mode) {
+		// Bias-free discrete construction:
+		// propagate Z continuously, but do not apply the continuous Kq correction.
+		// The finite Kq map is applied at the GPS event instead.
+		state.ZHat = SIM23(leftMat) * state.ZHat;
+	} else {
+		// Existing continuous Kq implementation
+		heapVars.GammaInv = SIM23::identity();
+
+		const GL2 S_Gamma =
+			0.5 * state.ZHat.A().transposed()
+			* GL2(gains.Q11.get(), 0., 0., gains.Q22.get())
+			* state.ZHat.A();
+
+		heapVars.GammaInv.A() = GL2::identity() - dt * S_Gamma;
+
+		// Existing bias gain transformation
+		compute_bias_update_imu(heapVars.GammaInv.inverse());
+
+		state.ZHat =
+			SIM23(leftMat) * state.ZHat * heapVars.GammaInv;
+	}
 
 #if HAL_LOGGING_ENABLED
     predict_runtime.log_sample(ESTIMATOR_RUNTIME_CINS_ID,
@@ -860,47 +915,186 @@ void AP_CINS::update_imu(const Vector3F &gyro_rads, const Vector3F &accel_mss, c
     phase_start_us = estimator_runtime_micros64();
 #endif
 
-    const bool gps_event_mode = gains.gps_correction_mode.get() == 1;
-    if (gps_event_mode && !delayer.gps_correction_pending) {
-        return;
-    }
-    const ftype correction_dt = gps_event_mode ? delayer.gps_correction_dt : dt;
-    delayer.gps_correction_pending = false;
+    // const int8_t gps_mode = gains.gps_correction_mode.get();
+	// const bool gps_event_mode = gps_mode >= 1;
+	// const bool gps_finite_mode = gps_mode == 2;
+
+	if (gps_event_mode && !delayer.gps_correction_pending) {
+		return;
+	}
+
+	const ftype correction_dt =
+		gps_event_mode ? delayer.gps_correction_dt : dt;
+
+	delayer.gps_correction_pending = false;
 
     // Update using delayed GPS
-    const ftype& current_lag = delayer.YR.tau();
-    const Vector3F& left_delay_vel = -heapVars.gravity_vector*current_lag;
-    const Vector3F& left_delay_pos = -heapVars.gravity_vector*0.5*current_lag*current_lag;
+	const ftype& current_lag = delayer.YR.tau();
 
-    const Gal3& YRInv = delayer.YR.inverse();
-    const Vector2F& ref_vel = Vector2F(1., 0.);
-    const Vector3F& mu0_vel = YRInv.vel();
-    const Vector3F mu_vel = delayer.gps_vel - left_delay_vel * ref_vel.x - left_delay_pos * ref_vel.y;
-    const ftype velErrorSq = update_vector_measurement_cts(mu_vel, mu0_vel, ref_vel,
-                                                          gains.gpsvel_att.get(), gains.gps_vel.get(),
-                                                          gains.gps_vel_gyr_bias.get(), gains.gps_vel_acc_bias.get(),
-                                                          correction_dt);
-    state.variances.velTest = velErrorSq / (state.variances.velVar * gains.variance_scale.get());
-    state.variances.velVar =  gains.variance_lowpass.get() * velErrorSq + (1.-gains.variance_lowpass.get()) * state.variances.velVar;
+	const Vector3F& left_delay_vel =
+		-heapVars.gravity_vector * current_lag;
+
+	const Vector3F& left_delay_pos =
+		-heapVars.gravity_vector * 0.5 * current_lag * current_lag;
+
+	const Gal3& YRInv = delayer.YR.inverse();
 
 
-    const Vector3F& mu0_pos = YRInv.pos();
-    const Vector2F& ref_pos = Vector2F(-current_lag, 1.);
-    const Vector3F mu_pos = delayer.gps_pos - left_delay_vel * ref_pos.x - left_delay_pos * ref_pos.y;
-    const ftype posErrorSq = update_vector_measurement_cts(mu_pos, mu0_pos, ref_pos,
-                                                          gains.gpspos_att.get(), gains.gps_pos.get(),
-                                                          gains.gps_pos_gyr_bias.get(), gains.gps_pos_acc_bias.get(),
-                                                          correction_dt);
-    state.variances.posTest = posErrorSq / (state.variances.posVar * gains.variance_scale.get());
-    state.variances.posVar =  gains.variance_lowpass.get() * posErrorSq + (1.-gains.variance_lowpass.get()) * state.variances.posVar;
+	// ---------------------------------------------------------
+	// Construct delayed GPS VELOCITY measurement tuple
+	// ---------------------------------------------------------
 
-    // The CINS algorithm does not have an internal variance state like an EKF.
-    // Instead, we compute the variance by applying a low-pass to the squared measurement errors.
-    // If a new squared measurement error arrives that is much larger than this low-passed value, it indicates something is wrong.
-    // This only works after initialising for a number of steps first.
-    if (state.variances.steps_to_initialise > 0) {
-        --state.variances.steps_to_initialise;
-    }
+	const Vector2F ref_vel(1., 0.);
+	const Vector3F mu0_vel = YRInv.vel();
+
+	const Vector3F mu_vel =
+		delayer.gps_vel
+		- left_delay_vel * ref_vel.x
+		- left_delay_pos * ref_vel.y;
+
+
+	// ---------------------------------------------------------
+	// Construct delayed GPS POSITION measurement tuple
+	// ---------------------------------------------------------
+
+	const Vector3F mu0_pos = YRInv.pos();
+	const Vector2F ref_pos(-current_lag, 1.);
+
+	const Vector3F mu_pos =
+		delayer.gps_pos
+		- left_delay_vel * ref_pos.x
+		- left_delay_pos * ref_pos.y;
+
+
+	// These are filled by whichever correction mode is active
+	ftype velErrorSq;
+	ftype posErrorSq;
+
+
+	// ---------------------------------------------------------
+	// Apply correction
+	// ---------------------------------------------------------
+
+	if (gps_finite_mode) {
+
+		/*
+		* Finite discrete correction.
+		*
+		* IMPORTANT:
+		* Position is applied first to match the proof.
+		* The velocity update is then called using the already
+		* updated XHat and ZHat, so all of its state-dependent
+		* quantities a, b, c, omega, etc. are recomputed.
+		*/
+
+		posErrorSq =
+			update_vector_measurement_discrete(
+				mu_pos,
+				mu0_pos,
+				ref_pos,
+				gains.gpspos_att.get(),
+				gains.gps_pos.get(),
+				correction_dt,
+				0);
+
+
+		velErrorSq =
+			update_vector_measurement_discrete(
+				mu_vel,
+				mu0_vel,
+				ref_vel,
+				gains.gpsvel_att.get(),
+				gains.gps_vel.get(),
+				correction_dt,
+				1);
+
+
+		// Common finite Kq correction, once after both sensors
+		update_Kq_discrete(correction_dt);
+
+		#if HAL_LOGGING_ENABLED
+			if (detail_log_rate.get() > 0) {
+				const GL2 &AZ = state.ZHat.A();
+
+				AP::logger().WriteStreaming(
+					"CIDA",
+					"TimeUS,Hq,A11,A12,A21,A22",
+					"ss----",
+					"F0----",
+					"Qfffff",
+					AP::dal().micros64(),
+					float(correction_dt),
+					float(AZ.a11()),
+					float(AZ.a12()),
+					float(AZ.a21()),
+					float(AZ.a22()));
+			}
+		#endif
+
+	} else {
+
+		/*
+		* Existing continuous / event-Euler implementation.
+		* Leave this exactly as it was.
+		*/
+
+		velErrorSq =
+			update_vector_measurement_cts(
+				mu_vel,
+				mu0_vel,
+				ref_vel,
+				gains.gpsvel_att.get(),
+				gains.gps_vel.get(),
+				gains.gps_vel_gyr_bias.get(),
+				gains.gps_vel_acc_bias.get(),
+				correction_dt);
+
+
+		posErrorSq =
+			update_vector_measurement_cts(
+				mu_pos,
+				mu0_pos,
+				ref_pos,
+				gains.gpspos_att.get(),
+				gains.gps_pos.get(),
+				gains.gps_pos_gyr_bias.get(),
+				gains.gps_pos_acc_bias.get(),
+				correction_dt);
+	}
+
+
+	// ---------------------------------------------------------
+	// Existing health / variance calculations - KEEP
+	// ---------------------------------------------------------
+
+	state.variances.velTest =
+		velErrorSq /
+		(state.variances.velVar * gains.variance_scale.get());
+
+	state.variances.velVar =
+		gains.variance_lowpass.get() * velErrorSq
+		+ (1. - gains.variance_lowpass.get())
+			* state.variances.velVar;
+
+
+	state.variances.posTest =
+		posErrorSq /
+		(state.variances.posVar * gains.variance_scale.get());
+
+	state.variances.posVar =
+		gains.variance_lowpass.get() * posErrorSq
+		+ (1. - gains.variance_lowpass.get())
+			* state.variances.posVar;
+
+
+	// The CINS algorithm does not have an internal variance state like an EKF.
+	// Instead, we compute the variance by applying a low-pass to the squared
+	// measurement errors. If a new squared measurement error arrives that is
+	// much larger than this low-passed value, it indicates something is wrong.
+	// This only works after initialising for a number of steps first.
+	if (state.variances.steps_to_initialise > 0) {
+		--state.variances.steps_to_initialise;
+	}
 
 #if HAL_LOGGING_ENABLED
     posvel_runtime.log_sample(ESTIMATOR_RUNTIME_CINS_ID,
@@ -1038,6 +1232,396 @@ ftype AP_CINS::update_vector_measurement_cts(const Vector3F &measurement, const 
     return measurementErrorSq;
 }
 
+ftype AP_CINS::update_vector_measurement_discrete(
+    const Vector3F &measurement,
+    const Vector3F &reference,
+    const Vector2F &ref_base,
+    const ftype &gain_R,
+    const ftype &gain_V,
+    const ftype h_requested,
+    const uint8_t update_kind)
+{
+	// Predicted measurement:
+    // muHat = RHat * mu0 + VHat * C
+    const Vector3F muHat =
+        state.XHat.rot() * reference
+        + state.XHat.vel() * ref_base.x
+        + state.XHat.pos() * ref_base.y;
+
+    const SIM23 Z_before = state.ZHat;
+    const SIM23 ZInv = Z_before.inverse();
+
+    // c = A_Z^{-1} C
+    const Vector2F c = ZInv.A() * ref_base;
+
+    // mu_Z = V_Z c
+    const Vector3F mu_Z =
+        Z_before.W1() * c.x
+        + Z_before.W2() * c.y;
+
+    // a = mu - mu_Z
+    const Vector3F a = measurement - mu_Z;
+
+    // b = muHat - mu_Z
+    const Vector3F b = muHat - mu_Z;
+
+    const ftype measurementErrorSq =
+        (measurement - muHat).length_squared();
+
+	const Vector3F omega =
+        (b % a) * (4.0 * gain_R);
+
+	const ftype n = c.length_squared();
+    const ftype b_norm_sq = b.length_squared();
+    const ftype omega_norm = omega.length();
+
+    // Current proof assumes kV > 0.
+    // For the initial GPS implementation, do no finite correction if it is not.
+    if (!is_positive(gain_V) || !is_positive(h_requested)) {
+        return measurementErrorSq;
+    }
+
+    constexpr ftype sigma =
+        2.0 / 3.14159265358979323846;
+
+    const ftype C_bound =
+        b_norm_sq *
+            (2.0 * gain_R
+             + 36.0 * gain_R * gain_R / gain_V)
+        + n *
+            ((gain_R + gain_V) *
+             (gain_R + gain_V) / gain_V);
+
+	constexpr ftype rho = 0.5;
+
+    ftype h = h_requested;
+
+    if (C_bound > 1.0e-12) {
+        h = MIN(
+            h,
+            rho * sigma / C_bound);
+    }
+
+    if (omega_norm > 1.0e-12) {
+        constexpr ftype half_pi =
+            1.57079632679489661923;
+
+        h = MIN(
+            h,
+            rho * half_pi / omega_norm);
+    }
+
+    if (!is_positive(h)) {
+        return measurementErrorSq;
+    }
+
+	#if HAL_LOGGING_ENABLED
+		if (detail_log_rate.get() > 0) {
+			AP::logger().WriteStreaming(
+				"CIDU",
+				"TimeUS,Kind,HReq,H,CBnd,Omega,CNorm",
+				"s-ss---",
+				"F-00---",
+				"QBfffff",
+				AP::dal().micros64(),
+				update_kind,
+				float(h_requested),
+				float(h),
+				float(C_bound),
+				float(omega_norm),
+				float(sqrtF(n)));
+		}
+	#endif
+
+	const ftype s =
+        sqrtF(1.0 + h * gain_V * n);
+
+    // Q = exp(h omega^x)
+    const Matrix3F Q =
+        Matrix3F::from_angular_velocity(omega * h);
+
+    // A = I + [h kV / (s+1)] c c^T
+    const ftype alpha =
+        h * gain_V / (s + 1.0);
+
+    const GL2 A_step(
+        1.0 + alpha * c.x * c.x,
+        alpha * c.x * c.y,
+        alpha * c.x * c.y,
+        1.0 + alpha * c.y * c.y);
+
+    const ftype lambda =
+        h * (gain_R + gain_V) / s;
+
+	const Vector3F U_base = a * lambda;
+
+    const Vector3F U1 = U_base * c.x;
+    const Vector3F U2 = U_base * c.y;
+
+	const Vector3F W_base =
+        (a - Q * b) * (lambda / s);
+
+    const Vector3F W1 = W_base * c.x;
+    const Vector3F W2 = W_base * c.y;
+
+	const SIM23 D(
+        Q,
+        W1,
+        W2,
+        GL2::identity());
+
+    const SIM23 B(
+        heapVars.I3,
+        U1,
+        U2,
+        A_step);
+
+	const SIM23 correction =
+        Z_before * D * ZInv;
+
+    // SIM23 stores W1=velocity, W2=position.
+    // Gal3 constructor order is R, position, velocity, tau.
+    const Gal3F correction_gal(
+        correction.R(),
+        correction.W2(),
+        correction.W1(),
+        0.0);
+
+    state.XHat =
+        correction_gal * state.XHat;
+
+    state.ZHat =
+        Z_before * B;
+
+    return measurementErrorSq;
+}
+
+ftype AP_CINS::update_attitude_measurement_discrete(
+    const Vector3F &measurement,
+    const Vector3F &reference,
+    const ftype &gain_R,
+    const ftype h_requested)
+{
+    // Attitude-only measurement:
+    //
+    // mu = R * mu0
+    //
+    // For magnetometer C = 0, therefore:
+    // c = 0
+    // mu_Z = 0
+    // A_step = I
+    // U = 0
+    // W = 0
+    //
+    // The finite correction therefore only requires Q.
+
+    const Vector3F muHat =
+        state.XHat.rot() * reference;
+
+    const ftype measurementErrorSq =
+        (measurement - muHat).length_squared();
+
+    if (!is_positive(gain_R) || !is_positive(h_requested)) {
+        return measurementErrorSq;
+    }
+
+    const SIM23 Z_before = state.ZHat;
+    const SIM23 ZInv = Z_before.inverse();
+
+    // For C = 0:
+    // a = measurement
+    // b = muHat
+    const Vector3F &a = measurement;
+    const Vector3F &b = muHat;
+
+    // omega = 4 k_R (b x a)
+    const Vector3F omega =
+        (b % a) * (4.0 * gain_R);
+
+    const ftype omega_norm = omega.length();
+    const ftype b_norm_sq = b.length_squared();
+
+    // For the attitude-only map the finite-step bound reduces to:
+    //
+    // C_mag = 2 k_R ||b||^2
+    //
+    // h <= min(
+    //     sigma / C_mag,
+    //     pi / (2 ||omega||)
+    // )
+    //
+    // with sigma = 2/pi.
+
+    constexpr ftype sigma =
+        2.0 / 3.14159265358979323846;
+
+    const ftype C_bound =
+        2.0 * gain_R * b_norm_sq;
+
+    constexpr ftype rho = 0.5;
+
+    ftype h = h_requested;
+
+    if (C_bound > 1.0e-12) {
+        h = MIN(
+            h,
+            rho * sigma / C_bound);
+    }
+
+    if (omega_norm > 1.0e-12) {
+        constexpr ftype half_pi =
+            1.57079632679489661923;
+
+        h = MIN(
+            h,
+            rho * half_pi / omega_norm);
+    }
+
+    if (!is_positive(h)) {
+        return measurementErrorSq;
+    }
+
+#if HAL_LOGGING_ENABLED
+    if (detail_log_rate.get() > 0) {
+        // Reuse CIDU:
+        // Kind 0 = GPS position
+        // Kind 1 = GPS velocity
+        // Kind 2 = magnetometer
+        AP::logger().WriteStreaming(
+            "CIDU",
+            "TimeUS,Kind,HReq,H,CBnd,Omega,CNorm",
+            "s-ss---",
+            "F-00---",
+            "QBfffff",
+            AP::dal().micros64(),
+            uint8_t(2),
+            float(h_requested),
+            float(h),
+            float(C_bound),
+            float(omega_norm),
+            0.0f);
+    }
+#endif
+
+    // Q = exp(h omega^x)
+    const Matrix3F Q =
+        Matrix3F::from_angular_velocity(omega * h);
+
+    // D = [Q  0
+    //      0  I]
+    const SIM23 D(
+        Q,
+        heapVars.zero_vector,
+        heapVars.zero_vector,
+        GL2::identity());
+
+    // Apply the exact finite group action:
+    //
+    // XHat+ = Z D Z^-1 XHat
+    //
+    // Note that although D itself contains no translational component,
+    // conjugating by Z can produce velocity/position components in the
+    // correction applied to XHat.
+    const SIM23 correction =
+        Z_before * D * ZInv;
+
+	const Gal3F correction_gal(
+		correction.R(),
+		correction.W2(),
+		correction.W1(),
+		0.0);
+
+	// Save state immediately before MAG jump
+	const Vector3F vel_before = state.XHat.vel();
+	const Vector3F pos_before = state.XHat.pos();
+
+	state.XHat =
+		correction_gal * state.XHat;
+
+	const Vector3F delta_vel =
+		state.XHat.vel() - vel_before;
+
+	const Vector3F delta_pos =
+		state.XHat.pos() - pos_before;
+
+	const ftype delta_theta =
+		h * omega_norm;
+
+	#if HAL_LOGGING_ENABLED
+	if (detail_log_rate.get() > 0) {
+		AP::logger().WriteStreaming(
+			"CIMJ",
+			"TimeUS,DTh,DVN,DVE,DVD,DPN,DPE,DPD",
+			"s-------",
+			"F-------",
+			"Qfffffff",
+			AP::dal().micros64(),
+			float(delta_theta),
+			float(delta_vel.x),
+			float(delta_vel.y),
+			float(delta_vel.z),
+			float(delta_pos.x),
+			float(delta_pos.y),
+			float(delta_pos.z));
+	}
+	#endif
+
+	// IMPORTANT: no ZHat update here.
+	// For C = 0, B = I and Z is unchanged.
+
+	return measurementErrorSq;
+}
+
+void AP_CINS::update_Kq_discrete(const ftype h)
+{
+    if (!is_positive(h)) {
+        return;
+    }
+
+    const GL2 Kq(
+        gains.Q11.get(), 0.0,
+        0.0, gains.Q22.get());
+
+    // Mq = A_Z^T Kq A_Z
+    const GL2 Mq =
+        state.ZHat.A().transposed()
+        * Kq
+        * state.ZHat.A();
+
+    // N = I + h Mq
+    const GL2 N =
+        GL2::identity() + h * Mq;
+
+	const ftype det_N = N.det();
+
+    if (det_N <= 0.0) {
+        // Should never occur for valid Kq >= 0.
+        return;
+    }
+
+    const ftype root_det =
+        sqrtF(det_N);
+
+    const ftype denom =
+        sqrtF(N.trace() + 2.0 * root_det);
+
+    const GL2 sqrt_N =
+        (1.0 / denom)
+        * (N + root_det * GL2::identity());
+
+    const GL2 Hq =
+        sqrt_N.inverse();
+
+	const SIM23 Bq(
+        heapVars.I3,
+        heapVars.zero_vector,
+        heapVars.zero_vector,
+        Hq);
+
+    state.ZHat =
+        state.ZHat * Bq;
+}
+
 /*
   initialise yaw from compass, if available
  */
@@ -1050,6 +1634,11 @@ bool AP_CINS::init_yaw(void)
     ftype roll_rad, pitch_rad, yaw_rad;
     state.XHat.rot().to_euler(&roll_rad, &pitch_rad, &yaw_rad);
     state.XHat.rot().from_euler(roll_rad, pitch_rad, mag_yaw);
+
+#if HAL_LOGGING_ENABLED
+    AP::logger().WriteEstimatorReset(AP::dal().micros64(), AP::dal().millis(), 1, DAL_CORE(0),
+                                    AP_Logger::EstimatorReset::ATTITUDE, 255);
+#endif
 
     return true;
 }
@@ -1135,6 +1724,10 @@ bool AP_CINS::get_compass_vector(Vector3F &mag_vec, Vector3F &mag_ref, ftype &dt
 
 void AP_CINS::update_attitude_from_compass()
 {
+	if (!done_yaw_init) {
+        return;
+    }
+
     ftype dt;
     Vector3F mag_vec, mag_ref;
     if (!get_compass_vector(mag_vec, mag_ref, dt)) {
@@ -1143,9 +1736,38 @@ void AP_CINS::update_attitude_from_compass()
     mag_vec *= 1.e-3; // Convert mag measurement from milliGauss to Gauss
 
 
-    Vector2F zero_2;
-    const ftype magErrorSq = update_vector_measurement_cts(mag_ref, mag_vec, zero_2, gains.mag_att.get(), 0.0, gains.mag_gyr_bias.get(), gains.mag_acc_bias.get(), dt);
-    state.variances.magTest = magErrorSq / (state.variances.magVar * gains.variance_scale.get());
+    ftype magErrorSq;
+
+	if (gains.gps_correction_mode.get() == 2) {
+
+		// Finite event-based magnetometer correction.
+		// get_compass_vector() already ensures this only runs
+		// once for each fresh magnetometer sample.
+		magErrorSq =
+			update_attitude_measurement_discrete(
+				mag_ref,
+				mag_vec,
+				gains.mag_att.get(),
+				dt);
+
+	} else {
+
+		// Existing continuous correction
+		const Vector2F zero_2(0.0, 0.0);
+
+		magErrorSq =
+			update_vector_measurement_cts(
+				mag_ref,
+				mag_vec,
+				zero_2,
+				gains.mag_att.get(),
+				0.0,
+				gains.mag_gyr_bias.get(),
+				gains.mag_acc_bias.get(),
+				dt);
+	}
+
+	state.variances.magTest = magErrorSq / (state.variances.magVar * gains.variance_scale.get());
     state.variances.magVar =  gains.variance_lowpass.get() * magErrorSq + (1.-gains.variance_lowpass.get()) * state.variances.magVar;
 }
 

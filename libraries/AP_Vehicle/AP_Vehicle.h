@@ -317,6 +317,17 @@ public:
 
 protected:
 
+#if AP_STARTUP_DIAGNOSTICS_ENABLED && HAL_GCS_ENABLED
+    void startup_trace_begin(const char *stage);
+    void startup_trace_end();
+    void startup_trace_wait() const;
+    const char *_startup_stage = nullptr;
+    uint32_t _startup_stage_ms = 0;
+#else
+    void startup_trace_begin(const char *) {}
+    void startup_trace_end() {}
+#endif
+
     virtual void init_ardupilot() = 0;
     virtual void load_parameters() = 0;
     void load_parameters(AP_Int16 &format_version, const uint16_t expected_format_version);

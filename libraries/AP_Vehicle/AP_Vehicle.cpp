@@ -305,6 +305,36 @@ extern AP_Vehicle& vehicle;
 /*
   setup is called when the sketch starts
  */
+#if AP_STARTUP_DIAGNOSTICS_ENABLED && HAL_GCS_ENABLED
+// Serial diagnostics remain available before the onboard logger is ready.
+void AP_Vehicle::startup_trace_begin(const char *stage)
+{
+    _startup_stage = stage;
+    _startup_stage_ms = AP_HAL::millis();
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "BOOT %lu %s begin F=%lu",
+                  (unsigned long)_startup_stage_ms, stage,
+                  (unsigned long)hal.util->available_memory());
+}
+
+void AP_Vehicle::startup_trace_end()
+{
+    const uint32_t now = AP_HAL::millis();
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "BOOT %lu %s end D=%lu",
+                  (unsigned long)now, _startup_stage,
+                  (unsigned long)(now - _startup_stage_ms));
+    _startup_stage = nullptr;
+}
+
+void AP_Vehicle::startup_trace_wait() const
+{
+    const uint32_t now = AP_HAL::millis();
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "BOOT %lu %s wait D=%lu F=%lu",
+                  (unsigned long)now, _startup_stage ? _startup_stage : "between",
+                  (unsigned long)(_startup_stage ? now - _startup_stage_ms : 0),
+                  (unsigned long)hal.util->available_memory());
+}
+#endif
+
 void AP_Vehicle::setup()
 {
     // load the default values of variables listed in var_info[]
@@ -396,47 +426,67 @@ void AP_Vehicle::setup()
 
 #if AP_EXTERNAL_AHRS_ENABLED
     // call externalAHRS init before init_ardupilot to allow for external sensors
+    startup_trace_begin("ext-ahrs");
     externalAHRS.init();
+    startup_trace_end();
 #endif
 
 #if HAL_GENERATOR_ENABLED
+    startup_trace_begin("generator");
     generator.init();
+    startup_trace_end();
 #endif
 
 #if AP_STATS_ENABLED
     // initialise stats module
+    startup_trace_begin("stats");
     stats.init();
+    startup_trace_end();
 #endif
 
+    startup_trace_begin("board");
     BoardConfig.init();
+    startup_trace_end();
 
 #if HAL_CANMANAGER_ENABLED
+    startup_trace_begin("can");
     can_mgr.init();
+    startup_trace_end();
 #endif
 
 #if HAL_MSP_ENABLED
     // call MSP init before init_ardupilot to allow for MSP sensors
+    startup_trace_begin("msp");
     msp.init();
+    startup_trace_end();
 #endif
 
 #if HAL_LOGGING_ENABLED
+    startup_trace_begin("logger");
     logger.init(get_log_bitmask(), get_log_structures(), get_num_log_structures());
+    startup_trace_end();
 #endif
 
     // init cargo gripper
 #if AP_GRIPPER_ENABLED
+    startup_trace_begin("gripper");
     AP::gripper().init();
+    startup_trace_end();
 #endif
 
     // init_ardupilot is where the vehicle does most of its initialisation.
     init_ardupilot();
 
 #if AP_SCRIPTING_ENABLED
+    startup_trace_begin("script");
     scripting.init();
+    startup_trace_end();
 #endif // AP_SCRIPTING_ENABLED
 
 #if AP_AIRSPEED_ENABLED
+    startup_trace_begin("airspeed");
     airspeed.init();
+    startup_trace_end();
     if (airspeed.enabled()) {
         airspeed.calibrate(true);
     } 
@@ -449,7 +499,9 @@ void AP_Vehicle::setup()
 
 
 #if AP_SRV_CHANNELS_ENABLED
+    startup_trace_begin("servos");
     AP::srv().init();
+    startup_trace_end();
 #endif
 
     // gyro FFT needs to be initialized really late
@@ -748,7 +800,11 @@ void AP_Vehicle::scheduler_delay_callback()
         if (AP_BoardConfig::in_config_error()) {
             GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL, "Config Error: fix problem then reboot");
         } else {
+#if AP_STARTUP_DIAGNOSTICS_ENABLED && HAL_GCS_ENABLED
+            _singleton->startup_trace_wait();
+#else
             GCS_SEND_TEXT(MAV_SEVERITY_INFO, "Initialising ArduPilot");
+#endif
         }
     }
 

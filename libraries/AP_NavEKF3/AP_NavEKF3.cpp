@@ -1,3 +1,4 @@
+#include <AP_Logger/AP_Logger.h>
 #include "AP_NavEKF3_core.h"
 
 #include "AP_NavEKF3.h"
@@ -1018,6 +1019,10 @@ void NavEKF3::UpdateFilter(void)
         // used as primary for some flights. As different IMUs may
         // have quite different noise characteristics this leads to
         // inconsistent performance
+#if HAL_LOGGING_ENABLED
+        AP::logger().WriteEstimatorReset(dal.micros64(), dal.millis(), 0, DAL_CORE(user_primary),
+                                        AP_Logger::EstimatorReset::LANE_SWITCH, DAL_CORE(primary));
+#endif
         primary = user_primary;
     }
 
@@ -1137,6 +1142,11 @@ void NavEKF3::switchLane(uint8_t new_lane_index)
         updateLaneSwitchYawResetData(new_lane_index, primary);
         updateLaneSwitchPosResetData(new_lane_index, primary);
         updateLaneSwitchPosDownResetData(new_lane_index, primary);
+
+#if HAL_LOGGING_ENABLED
+        AP::logger().WriteEstimatorReset(dal.micros64(), dal.millis(), 0, DAL_CORE(new_lane_index),
+                                        AP_Logger::EstimatorReset::LANE_SWITCH, DAL_CORE(primary));
+#endif
         primary = new_lane_index;
         lastLaneSwitch_ms = dal.millis();
         GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL, "EKF3 lane switch %u", primary);

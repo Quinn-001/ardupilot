@@ -491,16 +491,20 @@ class uploader(object):
 
     # send a PROG_MULTI command to write a collection of bytes
     def __program_multi(self, data):
-
         if runningPython3:
             length = len(data).to_bytes(1, byteorder='big')
         else:
             length = chr(len(data))
 
-        self.__send(uploader.PROG_MULTI)
-        self.__send(length)
-        self.__send(data)
-        self.__send(uploader.EOC)
+        packet = (
+            uploader.PROG_MULTI +
+            length +
+            bytes(data) +
+            uploader.EOC
+        )
+
+        self.__send(packet)
+        self.port.flush()
         self.__getSync()
 
     # send a PROG_EXTF_MULTI command to write a collection of bytes to external flash

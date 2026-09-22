@@ -1190,6 +1190,34 @@ static void write_replay_format_once(bool &format_emitted, uint8_t msg_type, uin
 }
 #endif
 
+void AP_Logger::WriteEstimatorReset(uint64_t time_us, uint32_t reset_ms, uint8_t estimator,
+                                    uint8_t core, EstimatorReset type, uint8_t previous_core)
+{
+    // Called from estimator updates on the main thread. No allocation or event queue.
+    static uint32_t sequence;
+    const uint32_t event_sequence = ++sequence;
+#if APM_BUILD_TYPE(APM_BUILD_Replay)
+    static bool format_emitted;
+    static constexpr uint8_t msg_id = REPLAY_LOG_NEW_MSG_MIN + 9;
+    write_replay_format_once(format_emitted, msg_id, sizeof(log_EstimatorReset),
+                             "ERST", "QIIBBBB", "TimeUS,ResetMS,Seq,E,C,Type,Prev",
+                             "ss-----", "FC-----");
+#else
+    static constexpr uint8_t msg_id = LOG_ESTIMATOR_RESET_MSG;
+#endif
+    const log_EstimatorReset pkt {
+        LOG_PACKET_HEADER_INIT(msg_id),
+        time_us: time_us,
+        reset_ms: reset_ms,
+        sequence: event_sequence,
+        estimator: estimator,
+        core: core,
+        type: uint8_t(type),
+        previous_core: previous_core,
+    };
+    WriteCriticalBlock(&pkt, sizeof(pkt));
+}
+
 void AP_Logger::WriteEstimatorRuntime(uint8_t estimator_id, uint32_t sample_count, float mean_us, float max_us, float last_us)
 {
     const uint64_t time_us = AP_HAL::micros64();

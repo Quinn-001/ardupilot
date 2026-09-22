@@ -21,24 +21,34 @@ void Copter::init_ardupilot()
 #endif
 
     // initialise notify system
+    startup_trace_begin("notify");
     notify.init();
+    startup_trace_end();
     notify_flight_mode();
 
     // initialise battery monitor
+    startup_trace_begin("battery");
     battery.init();
+    startup_trace_end();
 
 #if AP_RSSI_ENABLED
     // Init RSSI
     rssi.init();
 #endif
 
+    startup_trace_begin("baro-probe");
     barometer.init();
+    startup_trace_end();
 
     // setup telem slots with serial ports
+    startup_trace_begin("gcs-uarts");
     gcs().setup_uarts();
+    startup_trace_end();
 
 #if OSD_ENABLED
+    startup_trace_begin("osd");
     osd.init();
+    startup_trace_end();
 #endif
 
     // update motor interlock state
@@ -61,17 +71,25 @@ void Copter::init_ardupilot()
 #endif
 
     // allocate the motors class
+    startup_trace_begin("motors");
     allocate_motors();
+    startup_trace_end();
 
     // initialise rc channels including setting mode
     rc().convert_options(RC_Channel::AUX_FUNC::ARMDISARM_UNUSED, RC_Channel::AUX_FUNC::ARMDISARM_AIRMODE);
+    startup_trace_begin("rc-init");
     rc().init();
+    startup_trace_end();
 
     // sets up motors and output to escs
+    startup_trace_begin("rc-output");
     init_rc_out();
+    startup_trace_end();
 
     // check if we should enter esc calibration mode
+    startup_trace_begin("esc-check");
     esc_calibration_startup_check();
+    startup_trace_end();
 
     // motors initialised so parameters can be sent
     ap.initialised_params = true;
@@ -88,39 +106,53 @@ void Copter::init_ardupilot()
 
     // Do GPS init
     gps.set_log_gps_bit(MASK_LOG_GPS);
+    startup_trace_begin("gps");
     gps.init();
+    startup_trace_end();
 
     AP::compass().set_log_bit(MASK_LOG_COMPASS);
+    startup_trace_begin("compass");
     AP::compass().init();
+    startup_trace_end();
 
 #if AP_AIRSPEED_ENABLED
     airspeed.set_log_bit(MASK_LOG_IMU);
 #endif
 
 #if AP_OAPATHPLANNER_ENABLED
+    startup_trace_begin("oa");
     g2.oa.init();
+    startup_trace_end();
 #endif
 
     attitude_control->parameter_sanity_check();
 
 #if AP_OPTICALFLOW_ENABLED
     // initialise optical flow sensor
+    startup_trace_begin("optflow");
     optflow.init(MASK_LOG_OPTFLOW);
+    startup_trace_end();
 #endif      // AP_OPTICALFLOW_ENABLED
 
 #if HAL_MOUNT_ENABLED
     // initialise camera mount
+    startup_trace_begin("mount");
     camera_mount.init();
+    startup_trace_end();
 #endif
 
 #if AP_CAMERA_ENABLED
     // initialise camera
+    startup_trace_begin("camera");
     camera.init();
+    startup_trace_end();
 #endif
 
 #if AC_PRECLAND_ENABLED
     // initialise precision landing
+    startup_trace_begin("precland");
     init_precland();
+    startup_trace_end();
 #endif
 
 #if AP_LANDINGGEAR_ENABLED
@@ -135,21 +167,29 @@ void Copter::init_ardupilot()
     // read Baro pressure at ground
     //-----------------------------
     barometer.set_log_baro_bit(MASK_LOG_IMU);
+    startup_trace_begin("baro-cal");
     barometer.calibrate();
+    startup_trace_end();
 
 #if AP_RANGEFINDER_ENABLED
     // initialise rangefinder
+    startup_trace_begin("rangefind");
     init_rangefinder();
+    startup_trace_end();
 #endif
 
 #if HAL_PROXIMITY_ENABLED
     // init proximity sensor
+    startup_trace_begin("proximity");
     g2.proximity.init();
+    startup_trace_end();
 #endif
 
 #if AP_BEACON_ENABLED
     // init beacons used for non-gps position estimation
+    startup_trace_begin("beacon");
     g2.beacon.init();
+    startup_trace_end();
 #endif
 
 #if MODE_AUTO_ENABLED
@@ -207,14 +247,20 @@ void Copter::init_ardupilot()
 void Copter::startup_INS_ground()
 {
     // initialise ahrs (may push imu calibration into the mpu6000 if using that device).
+    startup_trace_begin("ahrs");
     ahrs.init();
+    startup_trace_end();
     ahrs.set_vehicle_class(AP_AHRS::VehicleClass::COPTER);
 
     // Warm up and calibrate gyro offsets
+    startup_trace_begin("imu-cal");
     ins.init(scheduler.get_loop_rate_hz());
+    startup_trace_end();
 
     // reset ahrs including gyro bias
+    startup_trace_begin("ahrs-reset");
     ahrs.reset();
+    startup_trace_end();
 }
 
 // position_ok - returns true if the horizontal absolute position is ok and home position is set

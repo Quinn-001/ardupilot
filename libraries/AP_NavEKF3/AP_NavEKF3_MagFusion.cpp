@@ -1,3 +1,4 @@
+#include <AP_Logger/AP_Logger.h>
 #include <AP_HAL/AP_HAL.h>
 
 #include "AP_NavEKF3.h"
@@ -1629,6 +1630,11 @@ void NavEKF3_core::resetQuatStateYawOnly(ftype yaw, ftype yawVariance, rotationO
     // record the yaw reset event
     yawResetAngle += deltaYaw;
     lastYawReset_ms = imuSampleTime_ms;
+
+#if HAL_LOGGING_ENABLED
+    AP::logger().WriteEstimatorReset(dal.micros64(), imuSampleTime_ms, 0, DAL_CORE(core_index),
+                                    AP_Logger::EstimatorReset::ATTITUDE, 255);
+#endif
 
     // record the yaw reset event
     recordYawResetsCompleted();

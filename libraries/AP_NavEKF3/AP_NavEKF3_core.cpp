@@ -1,3 +1,4 @@
+#include <AP_Logger/AP_Logger.h>
 #include <AP_HAL/AP_HAL.h>
 
 #include "AP_NavEKF3.h"
@@ -560,6 +561,11 @@ bool NavEKF3_core::InitialiseFilterBootstrap(void)
 
     // set to true now that states have be initialised
     statesInitialised = true;
+
+#if HAL_LOGGING_ENABLED
+    AP::logger().WriteEstimatorReset(dal.micros64(), imuSampleTime_ms, 0, DAL_CORE(core_index),
+                                    AP_Logger::EstimatorReset::INITIALIZATION, 255);
+#endif
 
     // reset inactive biases
     for (uint8_t i=0; i<INS_MAX_INSTANCES; i++) {

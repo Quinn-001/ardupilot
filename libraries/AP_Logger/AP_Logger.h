@@ -307,6 +307,13 @@ public:
     //! @deprecated Use the other signature with units and mults
     void WriteCritical(const char *name, const char *labels, const char *fmt, ...);
     void WriteCritical(const char *name, const char *labels, const char *units, const char *mults, const char *fmt, ...);
+    enum class EstimatorReset : uint8_t {
+        INITIALIZATION = 0, POSITION_NE = 1, POSITION_D = 2,
+        VELOCITY_NE = 3, VELOCITY_D = 4, ATTITUDE = 5,
+        HEIGHT_DATUM = 6, ORIGIN = 7, LANE_SWITCH = 8,
+    };
+    void WriteEstimatorReset(uint64_t time_us, uint32_t reset_ms, uint8_t estimator,
+                             uint8_t core, EstimatorReset type, uint8_t previous_core = 255);
     void WriteEstimatorRuntime(uint8_t estimator_id, uint32_t sample_count, float mean_us, float max_us, float last_us);
     void WriteEstimatorPhaseRuntime(uint8_t estimator_id, uint8_t phase_id, uint32_t sample_count,
                                     float mean_us, float max_us, float last_us);

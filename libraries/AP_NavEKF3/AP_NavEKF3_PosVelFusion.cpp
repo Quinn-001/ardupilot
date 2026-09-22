@@ -1,3 +1,4 @@
+#include <AP_Logger/AP_Logger.h>
 #include <AP_HAL/AP_HAL.h>
 
 #include "AP_NavEKF3.h"
@@ -88,6 +89,11 @@ void NavEKF3_core::ResetVelocity(resetDataSource velResetSource)
 
     // store the time of the reset
     lastVelReset_ms = imuSampleTime_ms;
+
+#if HAL_LOGGING_ENABLED
+    AP::logger().WriteEstimatorReset(dal.micros64(), imuSampleTime_ms, 0, DAL_CORE(core_index),
+                                    AP_Logger::EstimatorReset::VELOCITY_NE, 255);
+#endif
 }
 
 // resets position states to last GPS measurement or to zero if in constant position mode
@@ -179,6 +185,11 @@ void NavEKF3_core::ResetPosition(resetDataSource posResetSource)
     // store the time of the reset
     lastPosReset_ms = imuSampleTime_ms;
 
+#if HAL_LOGGING_ENABLED
+    AP::logger().WriteEstimatorReset(dal.micros64(), imuSampleTime_ms, 0, DAL_CORE(core_index),
+                                    AP_Logger::EstimatorReset::POSITION_NE, 255);
+#endif
+
     // clear the timeout flags and counters
     posTimeout = false;
     lastGpsPosPassTime_ms = imuSampleTime_ms;
@@ -254,6 +265,11 @@ void NavEKF3_core::ResetPositionNE(ftype posN, ftype posE)
 
     // store the time of the reset
     lastPosReset_ms = imuSampleTime_ms;
+
+#if HAL_LOGGING_ENABLED
+    AP::logger().WriteEstimatorReset(dal.micros64(), imuSampleTime_ms, 0, DAL_CORE(core_index),
+                                    AP_Logger::EstimatorReset::POSITION_NE, 255);
+#endif
 }
 
 // reset the stateStruct's D position
@@ -281,6 +297,11 @@ void NavEKF3_core::ResetPositionD(ftype posD)
 
     // store the time of the reset
     lastPosResetD_ms = imuSampleTime_ms;
+
+#if HAL_LOGGING_ENABLED
+    AP::logger().WriteEstimatorReset(dal.micros64(), imuSampleTime_ms, 0, DAL_CORE(core_index),
+                                    AP_Logger::EstimatorReset::POSITION_D, 255);
+#endif
 }
 
 // reset the vertical position state using the last height measurement
@@ -312,6 +333,11 @@ void NavEKF3_core::ResetHeight(void)
 
     // store the time of the reset
     lastPosResetD_ms = imuSampleTime_ms;
+
+#if HAL_LOGGING_ENABLED
+    AP::logger().WriteEstimatorReset(dal.micros64(), imuSampleTime_ms, 0, DAL_CORE(core_index),
+                                    AP_Logger::EstimatorReset::POSITION_D, 255);
+#endif
 
     // clear the timeout flags and counters
     hgtTimeout = false;
@@ -345,6 +371,11 @@ void NavEKF3_core::ResetHeight(void)
     outputDataNew.velocity.z = stateStruct.velocity.z;
     outputDataDelayed.velocity.z = stateStruct.velocity.z;
     vertCompFiltState.vel = outputDataNew.velocity.z;
+
+#if HAL_LOGGING_ENABLED
+    AP::logger().WriteEstimatorReset(dal.micros64(), imuSampleTime_ms, 0, DAL_CORE(core_index),
+                                    AP_Logger::EstimatorReset::VELOCITY_D, 255);
+#endif
 
     // reset the corresponding covariances
     zeroRows(P,6,6);
@@ -398,6 +429,11 @@ bool NavEKF3_core::resetHeightDatum(void)
     // set the terrain state to zero (on ground). The adjustment for
     // frame height will get added in the later constraints
     terrainState = 0;
+
+#if HAL_LOGGING_ENABLED
+    AP::logger().WriteEstimatorReset(dal.micros64(), imuSampleTime_ms, 0, DAL_CORE(core_index),
+                                    AP_Logger::EstimatorReset::HEIGHT_DATUM, 255);
+#endif
 
     return true;
 }
