@@ -70,6 +70,9 @@ public:
     */
     uint32_t peekbytes(uint8_t *data, uint32_t len);
 
+    // Read bytes at an offset without advancing the read pointer.
+    uint32_t peekbytes_at(uint8_t *data, uint32_t len, uint32_t offset);
+
     // Similar to peekbytes(), but will fill out IoVec struct with
     // both parts of the ring buffer if wraparound is happening, or
     // just one part. Returns the number of parts written to.
@@ -238,6 +241,14 @@ public:
     // !!! Note ObjectBuffer_TS is a duplicate of this update, in both places !!!
     bool peek(T &object) WARN_IF_UNUSED {
         return buffer->peekbytes((uint8_t*)&object, sizeof(T)) == sizeof(T);
+    }
+
+    // Copy an indexed object without advancing the read pointer.
+    bool peek(T &object, uint32_t index) const WARN_IF_UNUSED {
+        if (index >= available()) {
+            return false;
+        }
+        return buffer->peekbytes_at((uint8_t*)&object, sizeof(T), index * sizeof(T)) == sizeof(T);
     }
 
     /*
@@ -420,6 +431,15 @@ public:
     bool peek(T &object) WARN_IF_UNUSED {
         WITH_SEMAPHORE(sem);
         return buffer->peekbytes((uint8_t*)&object, sizeof(T)) == sizeof(T);
+    }
+
+    // Copy an indexed object without advancing the read pointer.
+    bool peek(T &object, uint32_t index) WARN_IF_UNUSED {
+        WITH_SEMAPHORE(sem);
+        if (index >= buffer->available() / sizeof(T)) {
+            return false;
+        }
+        return buffer->peekbytes_at((uint8_t*)&object, sizeof(T), index * sizeof(T)) == sizeof(T);
     }
 
     /*

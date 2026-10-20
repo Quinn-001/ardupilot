@@ -365,6 +365,7 @@ void AP_Baro::calibrate(bool save)
     }
 
     _guessed_ground_temperature = get_external_temperature();
+    ++_calibration_generation;
 
     // panic if all sensors are not calibrated
     uint8_t num_calibrated = 0;
@@ -403,6 +404,8 @@ void AP_Baro::update_calibration()
             sensors[i].ground_pressure.notify();
         }
     }
+
+    ++_calibration_generation;
 
     // always update the guessed ground temp
     _guessed_ground_temperature = get_external_temperature();

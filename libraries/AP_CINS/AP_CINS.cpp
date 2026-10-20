@@ -3,6 +3,8 @@
  */
 
 #include "AP_CINS.h"
+#include "AP_CINS_Delay.h"
+#include "AP_CINS_BaroAdmission.h"
 
 #if AP_EXTERNAL_AHRS_CINS_ENABLED
 
@@ -10,6 +12,7 @@
 #include <AP_HAL/AP_HAL.h>
 #include <AP_Logger/AP_EstimatorRuntimeLogging.h>
 #include <AP_Logger/AP_Logger.h>
+#include <GCS_MAVLink/GCS.h>
 
 extern const AP_HAL::HAL& hal;
 
@@ -37,7 +40,6 @@ extern const AP_HAL::HAL& hal;
 // Variance gain for health checking
 #define CINS_VAR_LOWPASS (0.01) // low pass of measurement errors
 #define CINS_VAR_SCALE (2.) // accept measurements with normalised variance smaller than this
-#define CINS_BARO_OFFSET_SAMPLES 5
 
 /*
   CINS is very fast, but stack hungry, using Os keeps stack usage down
@@ -200,7 +202,7 @@ const AP_Param::GroupInfo AP_CINS::var_info[] = {
 
     // @Param: BAMOD
     // @DisplayName: CINS barometer composite mode
-    // @Description: Selects the experimental GPS north/east plus barometric down position measurement. The update remains scheduled by new GPS samples and falls back to the unchanged GPS vector until the barometer is time-aligned, datum-aligned, healthy, and inside the consistency gate.
+    // @Description: Selects the experimental GPS north/east plus barometric down position measurement. Height uses GPS while disarmed; barometer alignment and height-source settings are frozen at arming. GPMOD=0 retains continuous barometer aiding unless BACT enables whole-position gating. GPMOD=2 may reject individual bad position events before the same smooth fallback. GPMOD=1 uses GPS position only. Changes to height-source settings are deferred until disarm.
     // @Values: 0:Disabled,1:Composite position vector
     // @User: Advanced
     AP_GROUPINFO("BAMOD", 22, AP_CINS, baro_config.mode, 0),
@@ -215,19 +217,131 @@ const AP_Param::GroupInfo AP_CINS::var_info[] = {
 
     // @Param: BAAGE
     // @DisplayName: CINS barometer maximum sample age
-    // @Description: Maximum allowed time mismatch between the selected barometer sample and the delayed GPS position measurement time. A mismatch above this value causes an unchanged GPS position update.
+    // @Description: Maximum allowed time mismatch between the selected barometer sample and the delayed GPS measurement time. Unavailable candidates are held in ungated CT or rejected by gated CT and finite modes until persistent GPS fallback.
     // @Range: 0.005 0.1
     // @Units: s
     // @User: Advanced
     AP_GROUPINFO("BAAGE", 24, AP_CINS, baro_config.max_age, 0.05),
 
     // @Param: BAGAT
-    // @DisplayName: CINS barometer consistency gate
-    // @Description: Maximum allowed difference between datum-aligned barometric Down and GPS Down. A larger difference causes an unchanged GPS position update. This bounds the perturbation introduced by the composite-vector method.
+    // @DisplayName: CINS barometer/GPS consistency gate
+    // @Description: Difference between datum-aligned barometric Down and GPS Down used as a source-consistency fault signal. It does not cause an immediate GPS source switch.
     // @Range: 0.1 50.0
     // @Units: m
     // @User: Advanced
     AP_GROUPINFO("BAGAT", 25, AP_CINS, baro_config.gate, 10.0),
+
+    // @Param: BAIGT
+    // @DisplayName: CINS barometer innovation gate
+    // @Description: Maximum absolute delayed barometric Down innovation accepted by finite mode and by continuous mode when BACT is enabled. Rejection disables the complete position measurement correction.
+    // @Range: 0.1 10.0
+    // @Units: m
+    // @User: Advanced
+    AP_GROUPINFO("BAIGT", 26, AP_CINS, baro_config.innovation_gate, 1.0),
+
+    // @Param: BAGEF
+    // @DisplayName: CINS barometer ground-effect gate
+    // @Description: Maximum absolute delayed barometric Down innovation accepted by finite mode and by continuous mode with BACT enabled while takeoff or touchdown ground effect is expected. Rejections caused by this ground-effect gate do not advance BAFLT.
+    // @Range: 0.1 5.0
+    // @Units: m
+    // @User: Advanced
+    AP_GROUPINFO("BAGEF", 27, AP_CINS, baro_config.ground_effect_gate, 0.5),
+
+    // @Param: BAFLT
+    // @DisplayName: CINS barometer persistent-fault time
+    // @Description: Time for which barometer aiding must remain persistently inconsistent or unavailable before BAMOD latches a smooth GPS-height fallback for the rest of the armed flight. Expected ground-effect innovation rejections do not contribute to this timer.
+    // @Range: 0.5 10.0
+    // @Units: s
+    // @User: Advanced
+    AP_GROUPINFO("BAFLT", 28, AP_CINS, baro_config.failure_time, 2.0),
+
+    // @Param: BASLW
+    // @DisplayName: CINS GPS fallback transition rate
+    // @Description: Maximum rate at which the temporary GPS-height alignment offset is removed after a persistent barometer fault.
+    // @Range: 0.1 5.0
+    // @Units: m/s
+    // @User: Advanced
+    AP_GROUPINFO("BASLW", 29, AP_CINS, baro_config.transition_rate, 0.5),
+
+    // @Param: BACT
+    // @DisplayName: CINS continuous barometer position gate
+    // @Description: Enables whole-position measurement rejection in GPMOD=0 using BAIGT and BAGEF. Acceptance is held between GPS events. IMU, velocity and common auxiliary corrections continue; BAFLT triggers the existing GPS fallback. Requires BAMOD=1. Finite mode is unchanged.
+    // @Values: 0:Disabled,1:Enabled
+    // @User: Advanced
+    AP_GROUPINFO("BACT", 30, AP_CINS, baro_config.ct_gate, 0),
+
+
+    // @Param: BBMOD
+    // @DisplayName: CINS barometer bias adaptation
+    // @Description: Experimental bounded GPS-referenced barometer bias adaptation after accepted position events. Requires BAMOD=1 and GPMOD=0 or 2. GPS must supply healthy accuracy and vertical velocity reports. The current measurement uses the previous bias; adaptation affects the next event. GPS height error can be interpreted as barometer bias.
+    // @Values: 0:Disabled,1:Enabled
+    // @RebootRequired: True
+    // @User: Advanced
+    AP_GROUPINFO("BBMOD", 31, AP_CINS, baro_config.bias_mode, 0),
+
+    // @Param: BBTC
+    // @DisplayName: CINS barometer bias time constant
+    // @Description: Time constant of qualified paired-sensor bias adaptation.
+    // @Range: 1 300
+    // @Units: s
+    // @User: Advanced
+    AP_GROUPINFO("BBTC", 32, AP_CINS, baro_config.bias_tc, 30.0),
+
+    // @Param: BBRAT
+    // @DisplayName: CINS barometer bias rate limit
+    // @Description: Maximum change rate of the estimated barometer bias.
+    // @Range: 0.001 1
+    // @Units: m/s
+    // @User: Advanced
+    AP_GROUPINFO("BBRAT", 33, AP_CINS, baro_config.bias_rate, 0.05),
+
+    // @Param: BBLIM
+    // @DisplayName: CINS barometer bias magnitude limit
+    // @Description: Maximum magnitude of adaptive barometer bias relative to the frozen startup datum.
+    // @Range: 0.1 20
+    // @Units: m
+    // @User: Advanced
+    AP_GROUPINFO("BBLIM", 34, AP_CINS, baro_config.bias_limit, 5.0),
+
+    // @Param: BBVAC
+    // @DisplayName: CINS barometer bias GPS vertical accuracy
+    // @Description: GPS vertical accuracy threshold for bias adaptation. Missing reports or values at or above this threshold hold adaptation.
+    // @Range: 0.1 10
+    // @Units: m
+    // @User: Advanced
+    AP_GROUPINFO("BBVAC", 35, AP_CINS, baro_config.bias_vacc, 2.0),
+
+    // @Param: BBSAC
+    // @DisplayName: CINS barometer bias GPS speed accuracy
+    // @Description: GPS speed accuracy threshold for bias adaptation. Missing reports or values at or above this threshold hold adaptation.
+    // @Range: 0.1 2
+    // @Units: m/s
+    // @User: Advanced
+    AP_GROUPINFO("BBSAC", 36, AP_CINS, baro_config.bias_sacc, 0.5),
+
+    // @Param: BBJMP
+    // @DisplayName: CINS barometer bias jump detection
+    // @Description: Maximum rate of paired height disagreement change or GPS height change unexplained by GPS vertical velocity. Exceeding either restarts qualification.
+    // @Range: 0.1 10
+    // @Units: m/s
+    // @User: Advanced
+    AP_GROUPINFO("BBJMP", 37, AP_CINS, baro_config.bias_jump, 1.0),
+
+    // @Param: BBDWL
+    // @DisplayName: CINS barometer bias qualification time
+    // @Description: Required consecutive qualified time before adapting bias. Invalid data, rejected position events, jumps or GPS gaps over one second restart qualification.
+    // @Range: 0 30
+    // @Units: s
+    // @User: Advanced
+    AP_GROUPINFO("BBDWL", 38, AP_CINS, baro_config.bias_dwell, 3.0),
+
+    // @Param: BASRC
+    // @DisplayName: CINS barometer height-source policy
+    // @Description: Selects persistent-fault GPS fallback or a fixed barometer composite in GPMOD=2 with BAMOD=1. Fixed mode retains sample health, timing, datum, innovation and ground-effect gates; rejected packets omit the whole position correction without substituting GPS. Velocity aiding continues. Frozen at arming; CT and GPS-only modes are unchanged.
+    // @Values: 0:Managed GPS fallback,1:Fixed barometer composite
+    // @RebootRequired: True
+    // @User: Advanced
+    AP_GROUPINFO("BASRC", 39, AP_CINS, baro_config.source_policy, 0),
 
     AP_GROUPEND
 };
@@ -261,11 +375,18 @@ void AP_CINS::init(void)
     state.acc_bias_gain_mat.pos.zero();
 
     delayer.YR = Gal3F::identity();
-    delayer.YR_stepper = Gal3F::identity();
     delayer.history_increment = Gal3F::identity();
     delayer.history_increment_count = 0;
     delayer.gps_correction_dt = 0.0;
     delayer.gps_correction_pending = false;
+    delayer.baro_down = nanf("");
+    delayer.baro_result = BaroCandidateResult::Disabled;
+    delayer.baro_armed_event = false;
+    delayer.datum_generation = 0;
+    delayer.ground_effect_expected = false;
+    delayer.position_correction_valid = true;
+    delayer.last_gps_vel_correction_applied = false;
+    delayer.last_gps_pos_correction_applied = false;
     delayer.buffer_failed = false;
     delayer.history_released_for_compass_calibration = false;
 
@@ -304,7 +425,9 @@ void AP_CINS::prepare_for_compass_calibration(void)
  */
 void AP_CINS::update(void)
 {
+    WITH_SEMAPHORE(datum_sem);
     auto &dal = AP::dal();
+    update_baro_arming();
     write_memory_diagnostic(dal.micros64());
 
     if (delayer.history_released_for_compass_calibration) {
@@ -320,7 +443,6 @@ void AP_CINS::update(void)
     static EstimatorEventRateAccumulator gps_vel_correction_rate;
     static EstimatorEventRateAccumulator gps_pos_correction_rate;
     bool gps_sample_received = false;
-    bool gps_correction_applied = false;
     uint32_t input_elapsed_us = 0;
     uint64_t phase_start_us;
 #endif
@@ -378,15 +500,15 @@ void AP_CINS::update(void)
     input_elapsed_us += uint32_t(estimator_runtime_micros64() - phase_start_us);
 #endif
 
+    delayer.last_gps_vel_correction_applied = false;
+    delayer.last_gps_pos_correction_applied = false;
     if (done_yaw_init && state.have_origin) {
-#if HAL_LOGGING_ENABLED
-        const bool gps_event_mode = gains.gps_correction_mode.get() >= 1;
-        gps_correction_applied = !gps_event_mode || delayer.gps_correction_pending;
-#endif
         update_imu(gyro, accel, dangle_dt);
     }
 
 #if HAL_LOGGING_ENABLED
+    const bool position_correction_valid_used = delayer.position_correction_valid;
+    const uint8_t position_source_used = uint8_t(baro_state.source);
     phase_start_us = estimator_runtime_micros64();
 #endif
     // see if we have new GPS data
@@ -410,10 +532,15 @@ void AP_CINS::update(void)
             }
             const auto & vel = gps.velocity();
             const Vector3d pos = state.origin.get_distance_NED_double(loc);
-            Vector3F measurement_pos = pos.toftype();
-            apply_baro_composite(measurement_pos, last_gps_fix_ms);
+            const Vector3F gps_pos = pos.toftype();
+            ftype baro_down = nanf("");
+            const BaroCandidateResult baro_result =
+                get_baro_candidate(gps_pos, last_gps_fix_ms, baro_down);
+            const bool ground_effect_expected =
+                dal.get_takeoff_expected() || dal.get_touchdown_expected();
 
-            update_gps(measurement_pos, vel.toftype(), gps_dt);
+            update_gps(gps_pos, vel.toftype(), gps_dt,
+                       baro_result, baro_down, ground_effect_expected);
 #if HAL_LOGGING_ENABLED
             gps_sample_received = true;
 #endif
@@ -454,9 +581,11 @@ void AP_CINS::update(void)
         if (gps_sample_received) {
             event_mask |= ESTIMATOR_CYCLE_GPS_SAMPLE;
         }
-        if (gps_correction_applied) {
-            event_mask |= ESTIMATOR_CYCLE_GPS_VEL_CORRECTION |
-                          ESTIMATOR_CYCLE_GPS_POS_CORRECTION;
+        if (delayer.last_gps_vel_correction_applied) {
+            event_mask |= ESTIMATOR_CYCLE_GPS_VEL_CORRECTION;
+        }
+        if (delayer.last_gps_pos_correction_applied) {
+            event_mask |= ESTIMATOR_CYCLE_GPS_POS_CORRECTION;
         }
         AP::logger().WriteEstimatorCycleRuntime(ESTIMATOR_RUNTIME_CINS_ID,
                                                 event_mask,
@@ -467,9 +596,11 @@ void AP_CINS::update(void)
         gps_sample_rate.log_event(ESTIMATOR_RUNTIME_CINS_ID,
                                   ESTIMATOR_EVENT_GPS_SAMPLE);
     }
-    if (gps_correction_applied) {
+    if (delayer.last_gps_vel_correction_applied) {
         gps_vel_correction_rate.log_event(ESTIMATOR_RUNTIME_CINS_ID,
                                           ESTIMATOR_EVENT_GPS_VEL_CORRECTION);
+    }
+    if (delayer.last_gps_pos_correction_applied) {
         gps_pos_correction_rate.log_event(ESTIMATOR_RUNTIME_CINS_ID,
                                           ESTIMATOR_EVENT_GPS_POS_CORRECTION);
     }
@@ -487,6 +618,16 @@ void AP_CINS::update(void)
         return;
     }
     last_detail_log_ms = now_ms;
+
+    // Record the held acceptance decision and actual module application at the
+    // existing detail rate, including CT cycles between GPS events.
+    if (baro_mode() == 1) {
+        AP::logger().WriteStreaming(
+            "CICG", "TimeUS,PosOK,PosUpd,VelUpd,Src", "s----", "F----", "QBBBB",
+            dal.micros64(), uint8_t(position_correction_valid_used),
+            uint8_t(delayer.last_gps_pos_correction_applied),
+            uint8_t(delayer.last_gps_vel_correction_applied), position_source_used);
+    }
 
     // @LoggerMessage: CINS
     // @Description: CINS state
@@ -577,8 +718,8 @@ void AP_CINS::write_memory_diagnostic(uint64_t time_us)
     flags |= done_yaw_init ? 4U : 0U;
     flags |= delayer.buffer_failed ? 8U : 0U;
     flags |= delayer.history_released_for_compass_calibration ? 16U : 0U;
-    flags |= baro_config.mode.get() == 1 ? 32U : 0U;
-    flags |= baro_state.offset_valid ? 64U : 0U;
+    flags |= baro_mode() == 1 ? 32U : 0U;
+    flags |= baro_datum.frozen_valid() ? 64U : 0U;
     flags |= baro_state.last_sample_accepted ? 128U : 0U;
     AP::logger().WriteCINSMemory(time_us, free_bytes, largest_block_bytes, flags);
 #endif
@@ -586,21 +727,213 @@ void AP_CINS::write_memory_diagnostic(uint64_t time_us)
 
 void AP_CINS::reset_baro_composite()
 {
-    baro_state.offset = 0.0;
-    baro_state.offset_sum = 0.0;
+    reset_baro_history();
+    if (!hal.util->get_soft_armed()) {
+        reset_baro_source();
+    }
+}
+
+void AP_CINS::reset_baro_history()
+{
+    baro_bias.reset();
+    if (baro_datum.phase() == CINSBaroDatum::Phase::Tracking) {
+        baro_datum.reset();
+    } else {
+        baro_datum.invalidate();
+    }
     baro_state.last_update_ms = 0;
     baro_state.next = 0;
     baro_state.count = 0;
-    baro_state.offset_sample_count = 0;
     baro_state.primary = uint8_t(-1);
     baro_state.healthy = false;
-    baro_state.offset_valid = false;
     baro_state.last_sample_accepted = false;
+}
+
+void AP_CINS::reset_baro_source()
+{
+    baro_state.source = HeightSource::GpsStartup;
+    baro_state.bad_time = 0.0;
+    baro_state.transition_offset = 0.0;
+    baro_state.selected_down = 0.0;
+    baro_state.selected_down_valid = false;
+}
+
+
+CINSBaroDatum::Config AP_CINS::raw_baro_datum_config() const
+{
+    const auto &barometer = AP::dal().baro();
+    return {gains.gps_lag.get(), baro_config.lag.get(), baro_config.max_age.get(), baro_config.gate.get(),
+            baro_config.innovation_gate.get(), baro_config.ground_effect_gate.get(),
+            baro_config.failure_time.get(), baro_config.transition_rate.get(),
+            baro_config.mode.get(), gains.gps_correction_mode.get(), baro_config.ct_gate.get(),
+            baro_config.bias_mode.get(), baro_config.source_policy.get(),
+            barometer.get_primary(), barometer.get_calibration_generation()};
+}
+
+CINSBaroDatum::Config AP_CINS::baro_datum_config() const
+{
+    if (!last_soft_armed) {
+        return raw_baro_datum_config();
+    }
+    auto config = flight_baro_config;
+    // Numeric settings are held for this flight. Sensor identity remains live,
+    // so recalibration or a primary switch still invalidates the frozen datum.
+    const auto &barometer = AP::dal().baro();
+    config.primary = barometer.get_primary();
+    config.calibration = barometer.get_calibration_generation();
+    return config;
+}
+
+
+bool AP_CINS::baro_datum_check(char *failure_msg, uint8_t failure_msg_len) const
+{
+    if (baro_mode() != 1 || gps_correction_mode() == 1) {
+        return true;
+    }
+    const uint32_t now = AP_HAL::millis();
+    const auto &barometer = AP::dal().baro();
+    const auto &gps = AP::dal().gps();
+    const uint8_t primary = barometer.get_primary();
+    float vacc = 0.0f;
+    float sacc = 0.0f;
+    const bool gps_qualified = gps.primary_sensor() == 0 && gps.status(0) >= AP_DAL_GPS::GPS_OK_FIX_3D &&
+        gps.vertical_accuracy(0, vacc) && gps.speed_accuracy(0, sacc) &&
+        isfinite(vacc) && vacc > 0.0f && vacc <= 5.0f &&
+        isfinite(sacc) && sacc > 0.0f && sacc <= 1.0f;
+    const char *reason = "height alignment settling";
+    if (!healthy() || !baro_state.healthy || primary >= barometer.num_instances() ||
+        !barometer.healthy(primary)) {
+        reason = "height alignment unavailable";
+    } else if (!gps_qualified || gps.last_message_time_ms(0) != baro_datum.sample_ms()) {
+        reason = "qualified GPS/baro pair unavailable";
+    } else if (baro_datum.has_offset() && !baro_datum.matches_config(baro_datum_config())) {
+        reason = "height calibration/config changed";
+    } else if (baro_datum.ready(now)) {
+        return true;
+    } else {
+        switch (baro_datum.reason(now)) {
+        case CINSBaroDatum::Reason::Pair: reason = "GPS/barometer alignment settling"; break;
+        case CINSBaroDatum::Reason::Prediction: reason = "GPS height state settling"; break;
+        case CINSBaroDatum::Reason::Changed: reason = "height calibration/config changed"; break;
+        case CINSBaroDatum::Reason::Stale: reason = "height alignment input stale"; break;
+        case CINSBaroDatum::Reason::Unavailable: reason = "qualified GPS/baro pair unavailable"; break;
+        default: break;
+        }
+    }
+    hal.util->snprintf(failure_msg, failure_msg_len, "CINS: %s", reason);
+    return false;
+}
+
+bool AP_CINS::pre_arm_check(char *failure_msg, uint8_t failure_msg_len) const
+{
+    WITH_SEMAPHORE(datum_sem);
+    return baro_datum_check(failure_msg, failure_msg_len);
+}
+
+bool AP_CINS::prepare_for_arming(bool required, char *failure_msg, uint8_t failure_msg_len)
+{
+    WITH_SEMAPHORE(datum_sem);
+    flight_config_prepared = false;
+    if (baro_mode() != 1 || gps_correction_mode() == 1) {
+        flight_baro_config = raw_baro_datum_config();
+        flight_config_prepared = true;
+        return true;
+    }
+    if (!baro_datum_check(failure_msg, failure_msg_len)) {
+        if (!required) {
+            flight_baro_config = raw_baro_datum_config();
+            flight_config_prepared = true;
+        }
+        return !required;
+    }
+    const bool prepared = baro_datum.prepare(AP_HAL::millis());
+    if (prepared || !required) {
+        flight_baro_config = raw_baro_datum_config();
+        flight_config_prepared = true;
+    } else {
+        hal.util->snprintf(failure_msg, failure_msg_len, "CINS: height alignment expired");
+    }
+    write_baro_datum_diagnostic();
+    return prepared || !required;
+}
+
+void AP_CINS::cancel_arming_preparation()
+{
+    WITH_SEMAPHORE(datum_sem);
+    if (!hal.util->get_soft_armed()) {
+        flight_config_prepared = false;
+    }
+    if (!hal.util->get_soft_armed() && baro_datum.phase() == CINSBaroDatum::Phase::Prepared) {
+        baro_datum.reset();
+        baro_bias.reset();
+        write_baro_datum_diagnostic();
+    }
+}
+
+bool AP_CINS::arming_reference_prepared() const
+{
+    WITH_SEMAPHORE(datum_sem);
+    return baro_datum.phase() == CINSBaroDatum::Phase::Prepared;
+}
+
+void AP_CINS::update_baro_arming()
+{
+    const bool armed = hal.util->get_soft_armed();
+    if (armed == last_soft_armed) {
+        return;
+    }
+    last_soft_armed = armed;
+    settings_change_reported = false;
+    if (armed) {
+        if (!flight_config_prepared) {
+            flight_baro_config = raw_baro_datum_config();
+        }
+        baro_datum.commit(AP::dal().millis());
+    } else {
+        flight_config_prepared = false;
+        baro_datum.reset();
+        baro_bias.reset();
+        // A queued armed event must not reintroduce barometer aiding after disarm.
+        delayer.baro_armed_event = false;
+        delayer.aiding_pos = delayer.gps_pos;
+        delayer.position_correction_valid = true;
+    }
+    reset_baro_source();
+    write_baro_datum_diagnostic();
+}
+
+void AP_CINS::write_baro_datum_diagnostic() const
+{
+#if HAL_LOGGING_ENABLED
+    if (detail_log_rate.get() <= 0 || baro_mode() != 1) {
+        return;
+    }
+    const uint32_t now = AP::dal().millis();
+    AP::logger().WriteStreaming("CIBF", "TimeUS,GPSMS,Phase,Offset,PairD,GPSInn,Ready,Reason,Age,Gen",
+                               "ss-mmm--s-", "FC-000--C-", "QIBfffBBII",
+                               AP::dal().micros64(), baro_datum.sample_ms(), uint8_t(baro_datum.phase()),
+                               baro_datum.has_offset() ? baro_datum.offset() : nanf(""),
+                               baro_datum.pair_residual(), baro_datum.gps_innovation(),
+                               uint8_t(baro_datum.phase() == CINSBaroDatum::Phase::Frozen ?
+                                       baro_datum.frozen_valid() : baro_datum.ready(now)),
+                               uint8_t(baro_datum.reason(now)), now - baro_datum.sample_ms(),
+                               baro_datum.generation());
+#endif
 }
 
 void AP_CINS::update_baro_history()
 {
-    if (baro_config.mode.get() != 1) {
+    if (last_soft_armed && !settings_change_reported) {
+        const auto requested = raw_baro_datum_config();
+        auto frozen = flight_baro_config;
+        frozen.primary = requested.primary;
+        frozen.calibration = requested.calibration;
+        if (!(frozen == requested)) {
+            settings_change_reported = true;
+            GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "CINS: height settings deferred until disarm");
+        }
+    }
+    if (baro_mode() != 1) {
         reset_baro_composite();
         return;
     }
@@ -612,9 +945,13 @@ void AP_CINS::update_baro_history()
         return;
     }
 
-    if (primary != baro_state.primary) {
-        reset_baro_composite();
+    baro_datum.check_config(baro_datum_config());
+    const uint16_t calibration = barometer.get_calibration_generation();
+    if (primary != baro_state.primary || calibration != baro_state.calibration_generation) {
+        // Never release an armed fallback latch or relearn a frozen datum.
+        reset_baro_history();
         baro_state.primary = primary;
+        baro_state.calibration_generation = calibration;
     }
 
     if (!barometer.healthy(primary)) {
@@ -642,30 +979,28 @@ void AP_CINS::update_baro_history()
     }
 }
 
-bool AP_CINS::apply_baro_composite(Vector3F &gps_pos, uint32_t gps_timestamp_ms)
+AP_CINS::BaroCandidateResult AP_CINS::get_baro_candidate(
+    const Vector3F &gps_pos,
+    uint32_t gps_timestamp_ms,
+    ftype &baro_down)
 {
     // One diagnostic per new GPS sample, including failed alignment attempts.
-    // NaN means unavailable; Offset is the running estimate until Count reaches 5.
+    // NaN means unavailable; CIBF records tracking/prepared/frozen status.
     const float gps_down = gps_pos.z;
     float raw_down = nanf("");
     float aligned_down = nanf("");
     uint32_t timing_error_ms = UINT32_MAX;
-    enum class Result : uint8_t {
-        Accepted = 0, Disabled = 1, Unhealthy = 2, NoHistory = 3,
-        Configuration = 4, Timing = 5, Nonfinite = 6, Aligning = 7,
-        OffsetInvalid = 8, Gate = 9,
-    };
-    const auto finish = [&](Result result) {
+    baro_down = nanf("");
+
+    const auto finish = [&](BaroCandidateResult result) {
 #if HAL_LOGGING_ENABLED
         if (detail_log_rate.get() > 0) {
-            const float offset = baro_state.offset_valid ? baro_state.offset :
-                (baro_state.offset_sample_count > 0 ?
-                 baro_state.offset_sum / baro_state.offset_sample_count : nanf(""));
+            const float offset = baro_datum.has_offset() ? baro_datum.offset() : nanf("");
             AP::logger().WriteStreaming("CIBD", "TimeUS,GPSMS,GPSD,RawD,BarD,Offset,TErr,Count,Result",
                                        "ssmmmm---", "FC0000---", "QIffffIBB",
                                        AP::dal().micros64(), gps_timestamp_ms,
                                        gps_down, raw_down, aligned_down, offset,
-                                       timing_error_ms, baro_state.offset_sample_count, uint8_t(result));
+                                       timing_error_ms, baro_datum.count(), uint8_t(result));
         }
 #else
         (void)gps_down;
@@ -673,29 +1008,39 @@ bool AP_CINS::apply_baro_composite(Vector3F &gps_pos, uint32_t gps_timestamp_ms)
         (void)aligned_down;
         (void)timing_error_ms;
 #endif
-        return result == Result::Accepted;
+        return result;
     };
-    baro_state.last_sample_accepted = false;
-    if (baro_config.mode.get() != 1) {
-        return finish(Result::Disabled);
+
+    if (baro_mode() != 1) {
+        return finish(BaroCandidateResult::Disabled);
     }
     if (!baro_state.healthy) {
-        return finish(Result::Unhealthy);
+        return finish(BaroCandidateResult::Unhealthy);
     }
     if (baro_state.count == 0) {
-        return finish(Result::NoHistory);
+        return finish(BaroCandidateResult::NoHistory);
     }
 
-    const float gps_lag = gains.gps_lag.get();
-    const float baro_lag = baro_config.lag.get();
-    const float max_age = baro_config.max_age.get();
-    const float gate = baro_config.gate.get();
+    const float gps_lag = get_gps_lag();
+    const float baro_lag = baro_datum_config().baro_lag;
+    const float max_age = baro_datum_config().max_age;
+    const float gate = baro_datum_config().consistency_gate;
+    const float innovation_gate = baro_datum_config().innovation_gate;
+    const float ground_effect_gate = baro_datum_config().ground_effect_gate;
+    const float failure_time = baro_datum_config().failure_time;
+    const float transition_rate = baro_datum_config().transition_rate;
     if (!isfinite(gps_lag) || !isfinite(baro_lag) || !isfinite(max_age) ||
-        !isfinite(gate) || gps_lag < 0.0f || gps_lag > 0.2f ||
+        !isfinite(gate) || !isfinite(innovation_gate) ||
+        !isfinite(ground_effect_gate) || !isfinite(failure_time) ||
+        !isfinite(transition_rate) || gps_lag < 0.0f || gps_lag > 0.2f ||
         baro_lag < 0.0f || baro_lag > 0.2f ||
         max_age < 0.005f || max_age > 0.1f ||
-        gate < 0.1f || gate > 50.0f) {
-        return finish(Result::Configuration);
+        gate < 0.1f || gate > 50.0f ||
+        innovation_gate < 0.1f || innovation_gate > 10.0f ||
+        ground_effect_gate < 0.1f || ground_effect_gate > 5.0f ||
+        failure_time < 0.5f || failure_time > 10.0f ||
+        transition_rate < 0.1f || transition_rate > 5.0f) {
+        return finish(BaroCandidateResult::Configuration);
     }
 
     // GPS and barometer receipt timestamps share the AP_HAL millisecond clock.
@@ -719,63 +1064,333 @@ bool AP_CINS::apply_baro_composite(Vector3F &gps_pos, uint32_t gps_timestamp_ms)
 
     timing_error_ms = best_error_ms;
     raw_down = baro_state.history[best_index].down;
-    if (baro_state.offset_valid) {
-        aligned_down = raw_down - baro_state.offset;
+    if (baro_datum.has_offset()) {
+        aligned_down = raw_down - baro_datum.offset() -
+            (baro_datum_config().bias_mode == 1 ? baro_bias.bias() : 0.0f);
     }
     const uint32_t max_age_ms = uint32_t(max_age * 1000.0f + 0.5f);
     if (best_error_ms > max_age_ms) {
-        return finish(Result::Timing);
+        return finish(BaroCandidateResult::Timing);
     }
 
     const ftype raw_baro_down = baro_state.history[best_index].down;
     if (!isfinite(raw_baro_down) || gps_pos.is_nan() || gps_pos.is_inf()) {
-        return finish(Result::Nonfinite);
+        return finish(BaroCandidateResult::Nonfinite);
     }
 
-    // Estimate the fixed difference between the barometer's calibrated datum
-    // and the CINS origin from paired measurements, then freeze it. No composite
-    // sample is admitted during this startup alignment interval.
-    if (!baro_state.offset_valid) {
-        baro_state.offset_sum += raw_baro_down - gps_pos.z;
-        baro_state.offset_sample_count++;
-        if (baro_state.offset_sample_count < CINS_BARO_OFFSET_SAMPLES) {
-            return finish(Result::Aligning);
-        }
-        baro_state.offset = baro_state.offset_sum / baro_state.offset_sample_count;
-        baro_state.offset_valid = isfinite(baro_state.offset);
-        if (!baro_state.offset_valid) {
-            reset_baro_composite();
-            return finish(Result::OffsetInvalid);
-        }
+    const auto &gps = AP::dal().gps();
+    float vacc = 0.0f;
+    float sacc = 0.0f;
+    const bool qualified = gps.primary_sensor() == 0 && gps.status(0) >= AP_DAL_GPS::GPS_OK_FIX_3D &&
+        gps.vertical_accuracy(0, vacc) && gps.speed_accuracy(0, sacc) &&
+        isfinite(vacc) && vacc > 0.0f && vacc <= 5.0f &&
+        isfinite(sacc) && sacc > 0.0f && sacc <= 1.0f;
+    baro_datum.pair(gps_timestamp_ms, float(raw_baro_down), gps_down,
+                    baro_datum_config(), qualified);
+    if (!baro_datum.has_offset()) {
+        return finish(BaroCandidateResult::Aligning);
+    }
+    if (hal.util->get_soft_armed() && !baro_datum.frozen_valid()) {
+        return finish(BaroCandidateResult::DatumUnavailable);
     }
 
-    const ftype composite_down = raw_baro_down - baro_state.offset;
+    const ftype composite_down = raw_baro_down - baro_datum.offset() -
+        (baro_datum_config().bias_mode == 1 ? baro_bias.bias() : 0.0f);
     aligned_down = composite_down;
-    if (!isfinite(composite_down) || fabsF(composite_down - gps_pos.z) > gate) {
-        return finish(Result::Gate);
+    if (!isfinite(composite_down)) {
+        return finish(BaroCandidateResult::Nonfinite);
     }
 
-    gps_pos.z = composite_down;
-    baro_state.last_sample_accepted = true;
-    return finish(Result::Accepted);
+    // A GPS/barometer disagreement is now a source-consistency signal rather
+    // than an instruction to switch immediately to GPS height. Keeping the
+    // finite barometer candidate allows GPMOD=0 to preserve its continuous
+    // measurement structure and GPMOD=2 to make its own delayed-innovation test.
+    baro_down = composite_down;
+    if (fabsF(composite_down - gps_pos.z) > gate) {
+        return finish(BaroCandidateResult::Consistency);
+    }
+
+    return finish(BaroCandidateResult::Accepted);
 }
 
+void AP_CINS::update_baro_bias()
+{
+    if (baro_datum_config().bias_mode != 1) {
+        return;
+    }
+    const CINSBaroBias::Config cfg {
+        baro_config.bias_tc.get(), baro_config.bias_rate.get(), baro_config.bias_limit.get(),
+        baro_config.bias_jump.get(), baro_config.bias_dwell.get()
+    };
+    const float before = baro_bias.bias();
+    // Reconstruct the datum-aligned observation using the bias applied when
+    // the candidate was formed. The initial alignment remains frozen.
+    const float datum_down = delayer.baro_down + before;
+    const bool usable = baro_mode() == 1 && gps_correction_mode() != 1 &&
+        baro_datum.frozen_valid() && baro_state.source == HeightSource::Baro &&
+        delayer.baro_result == BaroCandidateResult::Accepted &&
+        baro_state.last_sample_accepted && delayer.position_correction_valid &&
+        delayer.last_gps_pos_correction_applied;
+    const auto result = baro_bias.update(cfg, delayer.bias_timestamp_ms, datum_down,
+                                       delayer.gps_pos.z, delayer.gps_vel.z, delayer.bias_trust, usable);
+#if HAL_LOGGING_ENABLED
+    if (detail_log_rate.get() > 0) {
+        AP::logger().WriteStreaming("CIBB", "TimeUS,GPSMS,Datum,Bias0,Bias1,Resid,Trust,Result",
+                                   "ssmmmm--", "FC00000-", "QIfffffB",
+                                   AP::dal().micros64(), delayer.bias_timestamp_ms,
+                                   datum_down, before, baro_bias.bias(),
+                                   float(delayer.baro_down - delayer.gps_pos.z),
+                                   delayer.bias_trust, uint8_t(result));
+    }
+#else
+    (void)result;
+#endif
+}
+
+void AP_CINS::write_baro_source_diagnostic(
+    const ftype gps_down,
+    const ftype baro_down,
+    const ftype innovation_down,
+    const ftype used_down,
+    const ftype bad_time,
+    const bool ground_effect_expected,
+    const bool position_valid) const
+{
+#if HAL_LOGGING_ENABLED
+    if (detail_log_rate.get() <= 0) {
+        return;
+    }
+
+    const ftype bg_diff =
+        (isfinite(baro_down) && isfinite(gps_down)) ? baro_down - gps_down : nanf("");
+    AP::logger().WriteStreaming(
+        "CIBS",
+        "TimeUS,GPSD,BarD,InnovD,UsedD,BGDiff,BadT,GE,Src,PosOK",
+        "smmmmms---", "F000000---", "QffffffBBB",
+        AP::dal().micros64(),
+        float(gps_down), float(baro_down), float(innovation_down),
+        float(used_down), float(bg_diff), float(bad_time),
+        uint8_t(ground_effect_expected), uint8_t(baro_state.source),
+        uint8_t(position_valid));
+#else
+    (void)gps_down;
+    (void)baro_down;
+    (void)innovation_down;
+    (void)used_down;
+    (void)bad_time;
+    (void)ground_effect_expected;
+    (void)position_valid;
+#endif
+}
+
+void AP_CINS::write_baro_innovation_diagnostic(
+    const ftype predicted_down,
+    const ftype baro_innovation_down,
+    const ftype gps_innovation_down,
+    const ftype current_lag) const
+{
+#if HAL_LOGGING_ENABLED
+    if (detail_log_rate.get() <= 0) {
+        return;
+    }
+
+    const GL2 &AZ = state.ZHat.A();
+    AP::logger().WriteStreaming(
+        "CIBX",
+        "TimeUS,PredD,BarInn,GPSInn,Lag,A11,A12,A21,A22",
+        "smmms----", "F0000----", "Qffffffff",
+        AP::dal().micros64(),
+        float(predicted_down), float(baro_innovation_down),
+        float(gps_innovation_down), float(current_lag),
+        float(AZ.a11()), float(AZ.a12()), float(AZ.a21()), float(AZ.a22()));
+#else
+    (void)predicted_down;
+    (void)baro_innovation_down;
+    (void)gps_innovation_down;
+    (void)current_lag;
+#endif
+}
+
+// Slew only the datum offset, so GPS motion is followed during the transition.
+void AP_CINS::update_gps_height_transition(const ftype gps_dt)
+{
+    const ftype max_step =
+        is_positive(gps_dt) ? baro_datum_config().transition_rate * gps_dt : 0.0;
+    if (fabsF(baro_state.transition_offset) <= max_step) {
+        baro_state.transition_offset = 0.0;
+        baro_state.source = HeightSource::Gps;
+    } else if (is_positive(max_step)) {
+        baro_state.transition_offset +=
+            (baro_state.transition_offset > 0.0 ? -max_step : max_step);
+    }
+    baro_state.selected_down = delayer.gps_pos.z + baro_state.transition_offset;
+}
+
+void AP_CINS::update_baro_source_ct(const Vector3F &gps_pos, const ftype gps_dt)
+{
+    delayer.aiding_pos = gps_pos;
+    delayer.position_correction_valid = true;
+    baro_state.last_sample_accepted = false;
+
+    const bool finite_baro_candidate =
+        delayer.baro_result == BaroCandidateResult::Accepted ||
+        delayer.baro_result == BaroCandidateResult::Consistency;
+
+    // Use GPS until the first aligned barometer candidate is available.
+    // Normal datum alignment is not an availability fault.
+    if (baro_state.source == HeightSource::GpsStartup) {
+        if (finite_baro_candidate) {
+            baro_state.source = HeightSource::Baro;
+            baro_state.selected_down_valid = true;
+        } else {
+            baro_state.selected_down = gps_pos.z;
+            const bool aligning = delayer.baro_result == BaroCandidateResult::Aligning ||
+                                  delayer.baro_result == BaroCandidateResult::NoHistory;
+            if (aligning) {
+                baro_state.bad_time = 0.0;
+            } else if (is_positive(gps_dt)) {
+                baro_state.bad_time += gps_dt;
+            }
+            if (baro_state.bad_time >= baro_datum_config().failure_time) {
+                baro_state.source = HeightSource::Gps;
+            }
+            write_baro_source_diagnostic(gps_pos.z, delayer.baro_down, nanf(""),
+                                         gps_pos.z, baro_state.bad_time,
+                                         delayer.ground_effect_expected, true);
+            return;
+        }
+    }
+
+    if (baro_state.source == HeightSource::Baro) {
+        if (finite_baro_candidate) {
+            // CT deliberately continues to use a finite but inconsistent baro
+            // sample. This preserves the original continuous measurement
+            // structure; the inconsistency only drives the persistent-fault timer.
+            delayer.aiding_pos.z = delayer.baro_down;
+            baro_state.selected_down = delayer.baro_down;
+            baro_state.last_sample_accepted = true;
+        } else {
+            // If no finite aligned barometer value exists at this GPS event,
+            // hold the previous vertical measurement rather than jump to GPS.
+            delayer.aiding_pos.z = baro_state.selected_down;
+        }
+
+        // A finite barometer sample disturbed during expected ground effect is
+        // intentionally still used by ungated CT, but it must not be interpreted
+        // as evidence of a persistent sensor failure.
+        const bool expected_ground_effect_candidate =
+            delayer.ground_effect_expected && finite_baro_candidate;
+        if (delayer.baro_result == BaroCandidateResult::Accepted ||
+            expected_ground_effect_candidate) {
+            baro_state.bad_time = 0.0;
+        } else if (is_positive(gps_dt)) {
+            baro_state.bad_time += gps_dt;
+        }
+
+        if (baro_state.bad_time >= baro_datum_config().failure_time) {
+            baro_state.source = HeightSource::GpsTransition;
+            baro_state.transition_offset = baro_state.selected_down - gps_pos.z;
+            // The first fallback sample is exactly continuous with the outgoing
+            // barometric/held height. Start slewing on the next GPS event.
+            delayer.aiding_pos.z = gps_pos.z + baro_state.transition_offset;
+            baro_state.selected_down = delayer.aiding_pos.z;
+            baro_state.last_sample_accepted = false;
+            write_baro_source_diagnostic(gps_pos.z, delayer.baro_down, nanf(""),
+                                         delayer.aiding_pos.z, baro_state.bad_time,
+                                         delayer.ground_effect_expected, true);
+            return;
+        }
+    }
+
+    if (baro_state.source == HeightSource::GpsTransition) {
+        update_gps_height_transition(gps_dt);
+        delayer.aiding_pos.z = baro_state.selected_down;
+        baro_state.last_sample_accepted = false;
+    } else if (baro_state.source == HeightSource::Gps) {
+        delayer.aiding_pos.z = gps_pos.z;
+        baro_state.selected_down = delayer.aiding_pos.z;
+        baro_state.last_sample_accepted = false;
+    }
+
+    write_baro_source_diagnostic(gps_pos.z, delayer.baro_down, nanf(""),
+                                 delayer.aiding_pos.z, baro_state.bad_time,
+                                 delayer.ground_effect_expected, true);
+}
 
 /*
   update on new GPS sample
  */
-void AP_CINS::update_gps(const Vector3F &pos, const Vector3F &vel, const ftype gps_dt)
+void AP_CINS::update_gps(
+    const Vector3F &gps_pos,
+    const Vector3F &vel,
+    const ftype gps_dt,
+    BaroCandidateResult baro_result,
+    const ftype baro_down,
+    const bool ground_effect_expected)
 {
-    // Update the delayer variables. The gps vel and pos are used at every time step through the delay structure.
-    delayer.YR = delayer.YR_stepper.inverse() * delayer.YR;
-    delayer.YR_stepper = Gal3F::identity();
+    // Update the delayer variables. Sensor-source management is performed at
+    // the GPS event, while the selected vector is consumed by the continuous
+    // or finite correction path in update_imu().
+    if (!AP_CINS_Delay::rebuild(delayer.stamped_inputs, delayer.history_increment, delayer.YR)) {
+        delayer.buffer_failed = true;
+        delayer.gps_correction_pending = false;
+        return;
+    }
+    // Snapshot quality with this packet; do not read a newer GPS at consumption.
+    delayer.bias_trust = 0.0f;
+    delayer.bias_timestamp_ms = AP::dal().gps().last_message_time_ms(0);
+    if (baro_datum_config().bias_mode == 1) {
+        const auto &gps = AP::dal().gps();
+        float vacc = 0.0f;
+        float sacc = 0.0f;
+        const float vmax = baro_config.bias_vacc.get();
+        const float smax = baro_config.bias_sacc.get();
+        if (gps.primary_sensor() == 0 &&
+            gps.status(0) >= AP_DAL_GPS::GPS_OK_FIX_3D && gps.num_sats(0) >= 6 &&
+            gps.have_vertical_velocity(0) && gps.vertical_accuracy(0, vacc) && gps.speed_accuracy(0, sacc) &&
+            isfinite(vacc) && vacc > 0.0f && isfinite(sacc) && sacc > 0.0f &&
+            isfinite(vmax) && vmax >= 0.1f && vmax <= 10.0f &&
+            isfinite(smax) && smax >= 0.1f && smax <= 2.0f && vacc < vmax && sacc < smax) {
+            delayer.bias_trust = (1.0f - vacc / vmax) * (1.0f - sacc / smax);
+        }
+    }
     delayer.gps_vel = vel;
-    delayer.gps_pos = pos;
+    delayer.gps_pos = gps_pos;
+    delayer.aiding_pos = gps_pos;
+    delayer.baro_down = baro_down;
+    delayer.baro_result = baro_result;
+    delayer.baro_armed_event = hal.util->get_soft_armed();
+    delayer.datum_generation = baro_datum.generation();
+    delayer.ground_effect_expected = ground_effect_expected;
+    delayer.position_correction_valid = true;
+
+    // A GPS fallback is latched only for an armed flight. While disarmed, keep
+    // the barometer history/datum but reset the source-manager state.
+    if (!hal.util->get_soft_armed()) {
+        reset_baro_source();
+    }
+
+    const int8_t gps_mode = gps_correction_mode();
+    if (baro_mode() != 1 || gps_mode == 1 || !delayer.baro_armed_event) {
+        // Disarmed and prepared CINS remains GPS-aided; alignment is observational.
+        baro_state.last_sample_accepted = false;
+        delayer.position_correction_valid = true;
+    } else if (gps_mode == 0 && baro_datum_config().ct_gate != 1) {
+        update_baro_source_ct(gps_pos, gps_dt);
+    } else if (gps_mode == 2 || gps_mode == 0) {
+        // Gated CT and finite mode finalise acceptance using the delayed predicted
+        // position measurement in update_imu().
+        delayer.position_correction_valid = false;
+    } else {
+        // Unknown correction modes do not enable the experimental BAMOD logic.
+        baro_state.last_sample_accepted = false;
+        delayer.position_correction_valid = true;
+    }
+
     if (is_positive(gps_dt)) {
         delayer.gps_correction_dt = gps_dt;
         delayer.gps_correction_pending = true;
     }
-
 }
 
 
@@ -791,7 +1406,7 @@ void AP_CINS::update_imu(const Vector3F &gyro_rads, const Vector3F &accel_mss, c
     uint64_t phase_start_us = estimator_runtime_micros64();
 #endif
 
-	const int8_t gps_mode = gains.gps_correction_mode.get();
+	const int8_t gps_mode = gps_correction_mode();
 	const bool gps_event_mode = gps_mode >= 1;
 	const bool gps_finite_mode = gps_mode == 2;
 
@@ -800,19 +1415,19 @@ void AP_CINS::update_imu(const Vector3F &gyro_rads, const Vector3F &accel_mss, c
     // Update the bias gain matrices
     // In mathematical terms, \dot{M} = B = - Ad_{Z^{-1} \hat{X}} [I_3, 0_3; 0_3, I_3; 0_3, 0_3].
     // Here, we split B into its parts and add them to the parts of the bias gain matrix.
-    // Bias-estimation sensitivity propagation is only part of the
-	// continuous/event-Euler observer. The finite DT construction
-	// (GPMOD=2) is explicitly bias-free.
-	if (!gps_finite_mode && done_yaw_init) {
+    // Propagate the IMU-bias sensitivity matrices in every correction mode.
+    // GPMOD=2 uses the same high-rate bias model as the continuous/event-Euler
+    // observer; only the aiding measurement jump is discretised differently.
+	if (done_yaw_init) {
 		const SIM23 XInv_Z = SIM23(state.XHat.inverse()) * state.ZHat;
 
 		state.gyr_bias_gain_mat.rot += -state.XHat.rot() * dt;
 		state.gyr_bias_gain_mat.vel +=
-			Matrix3F::skew_symmetric(XInv_Z.W1()) *
-			XInv_Z.R().transposed() * dt;
+			XInv_Z.R().transposed() *
+			Matrix3F::skew_symmetric(XInv_Z.W1()) * dt;
 		state.gyr_bias_gain_mat.pos +=
-			Matrix3F::skew_symmetric(XInv_Z.W2()) *
-			XInv_Z.R().transposed() * dt;
+			XInv_Z.R().transposed() *
+			Matrix3F::skew_symmetric(XInv_Z.W2()) * dt;
 
 		// state.acc_bias_gain_mat.rot is unchanged
 		state.acc_bias_gain_mat.vel +=
@@ -828,13 +1443,10 @@ void AP_CINS::update_imu(const Vector3F &gyro_rads, const Vector3F &accel_mss, c
         heapVars.gravity_vector * dt,
         -dt);
 
-	// GPMOD=2 is the bias-free finite construction.
-	// Continuous/event-Euler modes retain the original bias estimator.
-	const Vector3F gyro_input =
-		gps_finite_mode ? gyro_rads : (gyro_rads - state.gyr_bias);
-
-	const Vector3F accel_input =
-		gps_finite_mode ? accel_mss : (accel_mss - state.acc_bias);
+	// All modes propagate XHat using the estimated IMU biases. In GPMOD=2 the
+	// bias states are updated by the finite-event aiding maps below.
+	const Vector3F gyro_input = gyro_rads - state.gyr_bias;
+	const Vector3F accel_input = accel_mss - state.acc_bias;
 
 	const Gal3F rightMat =
 		Gal3F::exponential(
@@ -847,12 +1459,12 @@ void AP_CINS::update_imu(const Vector3F &gyro_rads, const Vector3F &accel_mss, c
 	state.XHat = leftMat * state.XHat * rightMat;
 
     // Update ZHat (Auxiliary Dynamics)
-	// const bool gps_finite_mode = gains.gps_correction_mode.get() == 2;
+	// const bool gps_finite_mode = gps_correction_mode() == 2;
 
 	if (gps_finite_mode) {
-		// Bias-free discrete construction:
-		// propagate Z continuously, but do not apply the continuous Kq correction.
-		// The finite Kq map is applied at the GPS event instead.
+		// Finite discrete construction: propagate Z continuously, but do not
+		// apply the continuous Kq correction. The exact finite Kq map (and its
+		// matching bias-sensitivity coordinate transform) is applied at the GPS event.
 		state.ZHat = SIM23(leftMat) * state.ZHat;
 	} else {
 		// Existing continuous Kq implementation
@@ -883,7 +1495,7 @@ void AP_CINS::update_imu(const Vector3F &gyro_rads, const Vector3F &accel_mss, c
     delayer.YR = delayer.YR * rightMat;
     delayer.internal_time += dt;
     const uint32_t internal_time_us = uint32_t(uint64_t(delayer.internal_time * 1.0e6));
-    const uint32_t gps_lag_us = uint32_t(gains.gps_lag.get() * 1.0e6f);
+    const uint32_t gps_lag_us = uint32_t(get_gps_lag() * 1.0e6f);
     delayer.history_increment = delayer.history_increment * rightMat;
     if (++delayer.history_increment_count >= CINS_HISTORY_DECIMATION) {
         stamped_Gal3F stamped_input {};
@@ -902,9 +1514,6 @@ void AP_CINS::update_imu(const Vector3F &gyro_rads, const Vector3F &accel_mss, c
     stamped_Gal3F back;
     while (delayer.stamped_inputs.peek(back) &&
            uint32_t(internal_time_us - back.timestamp_us) > gps_lag_us) {
-        Matrix3F back_rot;
-        back.rot.rotation_matrix(back_rot);
-        delayer.YR_stepper = delayer.YR_stepper * Gal3F(back_rot, back.pos, back.vel, back.tau);
         delayer.stamped_inputs.pop();
     }
 
@@ -915,7 +1524,7 @@ void AP_CINS::update_imu(const Vector3F &gyro_rads, const Vector3F &accel_mss, c
     phase_start_us = estimator_runtime_micros64();
 #endif
 
-    // const int8_t gps_mode = gains.gps_correction_mode.get();
+    // const int8_t gps_mode = gps_correction_mode();
 	// const bool gps_event_mode = gps_mode >= 1;
 	// const bool gps_finite_mode = gps_mode == 2;
 
@@ -926,6 +1535,7 @@ void AP_CINS::update_imu(const Vector3F &gyro_rads, const Vector3F &accel_mss, c
 	const ftype correction_dt =
 		gps_event_mode ? delayer.gps_correction_dt : dt;
 
+    const bool new_gps_event = delayer.gps_correction_pending;
 	delayer.gps_correction_pending = false;
 
     // Update using delayed GPS
@@ -954,21 +1564,194 @@ void AP_CINS::update_imu(const Vector3F &gyro_rads, const Vector3F &accel_mss, c
 
 
 	// ---------------------------------------------------------
-	// Construct delayed GPS POSITION measurement tuple
+	// Construct delayed POSITION measurement tuple
 	// ---------------------------------------------------------
 
 	const Vector3F mu0_pos = YRInv.pos();
 	const Vector2F ref_pos(-current_lag, 1.);
+	const Vector3F delay_pos_term =
+		left_delay_vel * ref_pos.x +
+		left_delay_pos * ref_pos.y;
+
+    // Build delayed vertical residual diagnostics once per BAMOD GPS event, even
+    // when ungated CT is in use. This keeps the diagnostics observational only
+    // and avoids adding new per-IMU-cycle work to the CT path.
+    bool finite_baro_candidate = false;
+    Vector3F mu_hat_pos;
+    ftype predicted_raw_down = nanf("");
+    ftype baro_innovation_down = nanf("");
+    if (delayer.baro_armed_event && hal.util->get_soft_armed() &&
+        delayer.datum_generation != baro_datum.generation()) {
+        // An armed datum change is an unavailable observation, not an
+        // instruction to bypass persistence and jump immediately to raw GPS.
+        delayer.baro_result = BaroCandidateResult::DatumUnavailable;
+        delayer.baro_down = nanf("");
+    }
+    if (baro_mode() == 1 && new_gps_event) {
+        finite_baro_candidate =
+            delayer.baro_result == BaroCandidateResult::Accepted ||
+            delayer.baro_result == BaroCandidateResult::Consistency;
+        mu_hat_pos =
+            state.XHat.rot() * mu0_pos +
+            state.XHat.vel() * ref_pos.x +
+            state.XHat.pos() * ref_pos.y;
+        predicted_raw_down = mu_hat_pos.z + delay_pos_term.z;
+        baro_innovation_down =
+            finite_baro_candidate ? delayer.baro_down - predicted_raw_down : nanf("");
+        const ftype gps_innovation_down =
+            delayer.gps_pos.z - predicted_raw_down;
+        if (!delayer.baro_armed_event) {
+            baro_datum.prediction(delayer.bias_timestamp_ms, float(gps_innovation_down));
+        }
+        write_baro_datum_diagnostic();
+        write_baro_innovation_diagnostic(
+            predicted_raw_down, baro_innovation_down, gps_innovation_down, current_lag);
+    }
+
+    // Select gated aiding once per GPS event. CT holds the acceptance decision
+    // between events, so an initially rejected sample cannot be reintroduced
+    // by a changing prediction at a later IMU step.
+    const bool armed_baro_event = delayer.baro_armed_event && hal.util->get_soft_armed();
+    const bool gated_baro = baro_mode() == 1 && armed_baro_event &&
+        (gps_finite_mode || (gps_mode == 0 && baro_datum_config().ct_gate == 1));
+    if (baro_mode() == 1 && new_gps_event && !armed_baro_event) {
+        delayer.aiding_pos = delayer.gps_pos;
+        delayer.position_correction_valid = true;
+        write_baro_source_diagnostic(delayer.gps_pos.z, delayer.baro_down,
+                                     baro_innovation_down, delayer.gps_pos.z, 0.0f,
+                                     delayer.ground_effect_expected, true);
+    }
+    if (gated_baro && new_gps_event) {
+        const auto admission = CINSBaroAdmission::evaluate(
+            finite_baro_candidate, baro_innovation_down, delayer.ground_effect_expected,
+            baro_datum_config().innovation_gate, baro_datum_config().ground_effect_gate);
+#if HAL_LOGGING_ENABLED
+        if (detail_log_rate.get() > 0) {
+            AP::logger().WriteStreaming(
+                "CIBA", "TimeUS,GPSMS,Finite,InnovBad,GEBad,Admit", "ss----", "FC----", "QIBBBB",
+                AP::dal().micros64(), delayer.bias_timestamp_ms,
+                uint8_t(finite_baro_candidate), uint8_t(admission.innovation_bad),
+                uint8_t(admission.ground_effect_bad), uint8_t(admission.accepted));
+        }
+#endif
+        if (gps_finite_mode && baro_datum_config().source_policy == 1) {
+            // Fixed source retains packet admission without persistent-fault fallback.
+            baro_state.source = HeightSource::Baro;
+            baro_state.bad_time = 0.0;
+            delayer.position_correction_valid = admission.accepted;
+            baro_state.last_sample_accepted = admission.accepted;
+            if (admission.accepted) {
+                delayer.aiding_pos = delayer.gps_pos;
+                delayer.aiding_pos.z = delayer.baro_down;
+                baro_state.selected_down = delayer.baro_down;
+                baro_state.selected_down_valid = true;
+            } else {
+                baro_state.selected_down_valid = false;
+            }
+            write_baro_source_diagnostic(
+                delayer.gps_pos.z, delayer.baro_down, baro_innovation_down,
+                admission.accepted ? delayer.baro_down : nanf(""),
+                0.0f, delayer.ground_effect_expected, admission.accepted);
+        } else {
+            const ftype source_dt = delayer.gps_correction_dt;
+
+            ftype innovation_down = baro_innovation_down;
+            bool transition_started = false;
+            delayer.position_correction_valid = false;
+            baro_state.last_sample_accepted = false;
+
+            const bool startup = baro_state.source == HeightSource::GpsStartup;
+            if (startup || baro_state.source == HeightSource::Baro) {
+                if (startup) {
+                    delayer.aiding_pos = delayer.gps_pos;
+                    delayer.position_correction_valid = true;
+                }
+                bool reject_position = !finite_baro_candidate;
+                bool ground_effect_rejection = false;
+                if (finite_baro_candidate) {
+                    Vector3F baro_pos = delayer.gps_pos;
+                    baro_pos.z = delayer.baro_down;
+
+                    ground_effect_rejection = admission.ground_effect_bad;
+                    reject_position = !admission.accepted;
+
+                    if (!reject_position) {
+                        baro_state.source = HeightSource::Baro;
+                        delayer.aiding_pos = baro_pos;
+                        delayer.position_correction_valid = true;
+                        baro_state.selected_down = delayer.baro_down;
+                        baro_state.selected_down_valid = true;
+                        baro_state.last_sample_accepted = true;
+                    }
+                }
+
+                // BAGAT disagreement is retained as a persistent source-consistency
+                // signal even when the delayed CINS innovation remains admissible.
+                const bool aligning = startup &&
+                    (delayer.baro_result == BaroCandidateResult::Aligning ||
+                     delayer.baro_result == BaroCandidateResult::NoHistory);
+                // Expected ground-effect innovations of either sign are an admissibility reason
+                // to reject this position event, not evidence of a persistent sensor fault.
+                // Reset BAFLT persistence so repeated landing ground-effect rejections can
+                // never accumulate into a GPS fallback. Other unavailable/non-GE failures
+                // retain the existing persistent-fault behaviour.
+                const bool fault_signal = !aligning && !ground_effect_rejection &&
+                    (reject_position ||
+                     delayer.baro_result == BaroCandidateResult::Consistency);
+                if (ground_effect_rejection) {
+                    baro_state.bad_time = 0.0;
+                } else if (fault_signal) {
+                    baro_state.bad_time += source_dt;
+                } else {
+                    baro_state.bad_time = 0.0;
+                }
+
+                if (baro_state.bad_time >= baro_datum_config().failure_time) {
+                    if (baro_state.source == HeightSource::GpsStartup) {
+                        // Already aiding with GPS: latch it without an artificial offset.
+                        baro_state.source = HeightSource::Gps;
+                    } else {
+                        baro_state.source = HeightSource::GpsTransition;
+                        baro_state.transition_offset =
+                            predicted_raw_down - delayer.gps_pos.z;
+                        delayer.aiding_pos = delayer.gps_pos;
+                        delayer.aiding_pos.z += baro_state.transition_offset;
+                        delayer.position_correction_valid = true;
+                        baro_state.selected_down = delayer.aiding_pos.z;
+                        baro_state.last_sample_accepted = false;
+                        transition_started = true;
+                    }
+                }
+            }
+
+            if (baro_state.source == HeightSource::GpsTransition && !transition_started) {
+                update_gps_height_transition(source_dt);
+                delayer.aiding_pos = delayer.gps_pos;
+                delayer.aiding_pos.z = baro_state.selected_down;
+                delayer.position_correction_valid = true;
+                baro_state.last_sample_accepted = false;
+            } else if (baro_state.source == HeightSource::Gps) {
+                delayer.aiding_pos = delayer.gps_pos;
+                delayer.position_correction_valid = true;
+                baro_state.selected_down = delayer.aiding_pos.z;
+                baro_state.last_sample_accepted = false;
+            }
+
+            write_baro_source_diagnostic(
+                delayer.gps_pos.z, delayer.baro_down, innovation_down,
+                delayer.position_correction_valid ? delayer.aiding_pos.z : nanf(""),
+                baro_state.bad_time, delayer.ground_effect_expected,
+                delayer.position_correction_valid);
+        }
+    }
 
 	const Vector3F mu_pos =
-		delayer.gps_pos
-		- left_delay_vel * ref_pos.x
-		- left_delay_pos * ref_pos.y;
+		delayer.aiding_pos - delay_pos_term;
 
 
 	// These are filled by whichever correction mode is active
-	ftype velErrorSq;
-	ftype posErrorSq;
+	ftype velErrorSq = 0.0;
+	ftype posErrorSq = 0.0;
 
 
 	// ---------------------------------------------------------
@@ -987,15 +1770,20 @@ void AP_CINS::update_imu(const Vector3F &gyro_rads, const Vector3F &accel_mss, c
 		* quantities a, b, c, omega, etc. are recomputed.
 		*/
 
-		posErrorSq =
-			update_vector_measurement_discrete(
-				mu_pos,
-				mu0_pos,
-				ref_pos,
-				gains.gpspos_att.get(),
-				gains.gps_pos.get(),
-				correction_dt,
-				0);
+		if (delayer.position_correction_valid) {
+			posErrorSq =
+				update_vector_measurement_discrete(
+					mu_pos,
+					mu0_pos,
+					ref_pos,
+					gains.gpspos_att.get(),
+					gains.gps_pos.get(),
+					gains.gps_pos_gyr_bias.get(),
+					gains.gps_pos_acc_bias.get(),
+					correction_dt,
+					0);
+			delayer.last_gps_pos_correction_applied = true;
+		}
 
 
 		velErrorSq =
@@ -1005,8 +1793,11 @@ void AP_CINS::update_imu(const Vector3F &gyro_rads, const Vector3F &accel_mss, c
 				ref_vel,
 				gains.gpsvel_att.get(),
 				gains.gps_vel.get(),
+				gains.gps_vel_gyr_bias.get(),
+				gains.gps_vel_acc_bias.get(),
 				correction_dt,
 				1);
+		delayer.last_gps_vel_correction_applied = true;
 
 
 		// Common finite Kq correction, once after both sensors
@@ -1050,16 +1841,22 @@ void AP_CINS::update_imu(const Vector3F &gyro_rads, const Vector3F &accel_mss, c
 				correction_dt);
 
 
-		posErrorSq =
-			update_vector_measurement_cts(
-				mu_pos,
-				mu0_pos,
-				ref_pos,
-				gains.gpspos_att.get(),
-				gains.gps_pos.get(),
-				gains.gps_pos_gyr_bias.get(),
-				gains.gps_pos_acc_bias.get(),
-				correction_dt);
+        // This call contains the complete position state, auxiliary and bias
+        // corrections. Skipping it preserves the measurement module boundary.
+        if (delayer.position_correction_valid) {
+            posErrorSq =
+                update_vector_measurement_cts(
+                    mu_pos,
+                    mu0_pos,
+                    ref_pos,
+                    gains.gpspos_att.get(),
+                    gains.gps_pos.get(),
+                    gains.gps_pos_gyr_bias.get(),
+                    gains.gps_pos_acc_bias.get(),
+                    correction_dt);
+            delayer.last_gps_pos_correction_applied = true;
+        }
+        delayer.last_gps_vel_correction_applied = true;
 	}
 
 
@@ -1077,14 +1874,16 @@ void AP_CINS::update_imu(const Vector3F &gyro_rads, const Vector3F &accel_mss, c
 			* state.variances.velVar;
 
 
-	state.variances.posTest =
-		posErrorSq /
-		(state.variances.posVar * gains.variance_scale.get());
+	if (delayer.last_gps_pos_correction_applied) {
+		state.variances.posTest =
+			posErrorSq /
+			(state.variances.posVar * gains.variance_scale.get());
 
-	state.variances.posVar =
-		gains.variance_lowpass.get() * posErrorSq
-		+ (1. - gains.variance_lowpass.get())
-			* state.variances.posVar;
+		state.variances.posVar =
+			gains.variance_lowpass.get() * posErrorSq
+			+ (1. - gains.variance_lowpass.get())
+				* state.variances.posVar;
+	}
 
 
 	// The CINS algorithm does not have an internal variance state like an EKF.
@@ -1095,6 +1894,12 @@ void AP_CINS::update_imu(const Vector3F &gyro_rads, const Vector3F &accel_mss, c
 	if (state.variances.steps_to_initialise > 0) {
 		--state.variances.steps_to_initialise;
 	}
+
+    // Adapt only after this event's acceptance and observer correction. Held
+    // CT measurements do not repeatedly update the bias.
+    if (new_gps_event) {
+        update_baro_bias();
+    }
 
 #if HAL_LOGGING_ENABLED
     posvel_runtime.log_sample(ESTIMATOR_RUNTIME_CINS_ID,
@@ -1238,6 +2043,8 @@ ftype AP_CINS::update_vector_measurement_discrete(
     const Vector2F &ref_base,
     const ftype &gain_R,
     const ftype &gain_V,
+    const ftype &gain_gyr_bias,
+    const ftype &gain_acc_bias,
     const ftype h_requested,
     const uint8_t update_kind)
 {
@@ -1376,6 +2183,110 @@ ftype AP_CINS::update_vector_measurement_discrete(
         U2,
         A_step);
 
+    // ---------------------------------------------------------------------
+    // Bias-augmented finite map
+    // ---------------------------------------------------------------------
+    // Snapshot M^- before updating the finite sensor sensitivity.
+    heapVars.M1Gyr = state.gyr_bias_gain_mat.rot;
+    heapVars.M2Gyr = state.gyr_bias_gain_mat.vel;
+    heapVars.M3Gyr = state.gyr_bias_gain_mat.pos;
+    heapVars.M1Acc = state.acc_bias_gain_mat.rot;
+    heapVars.M2Acc = state.acc_bias_gain_mat.vel;
+    heapVars.M3Acc = state.acc_bias_gain_mat.pos;
+
+    // Existing CINS measurement Jacobian C = Dh DR_Xhat Ad_Z. Reusing this
+    // keeps the finite sensitivity update in the same coordinates as the
+    // continuous bias estimator.
+    heapVars.C11 = -Matrix3F::skew_symmetric(muHat) * Z_before.R();
+    heapVars.C11 += -Matrix3F::skew_symmetric(ZInv.W1()) * ref_base.x;
+    heapVars.C11 += -Matrix3F::skew_symmetric(ZInv.W2()) * ref_base.y;
+    heapVars.C12 = Z_before.R() * ZInv.A().a11() * ref_base.x;
+    heapVars.C12 += Z_before.R() * ZInv.A().a12() * ref_base.y;
+    heapVars.C13 = Z_before.R() * ZInv.A().a21() * ref_base.x;
+    heapVars.C13 += Z_before.R() * ZInv.A().a22() * ref_base.y;
+
+    // Reuse heap scratch matrices for H M_g and H M_a to avoid adding large
+    // Matrix3F temporaries to the estimator stack.
+    heapVars.A12 =
+        heapVars.C11 * heapVars.M1Gyr
+        + heapVars.C12 * heapVars.M2Gyr
+        + heapVars.C13 * heapVars.M3Gyr;
+    heapVars.A13 =
+        heapVars.C11 * heapVars.M1Acc
+        + heapVars.C12 * heapVars.M2Acc
+        + heapVars.C13 * heapVars.M3Acc;
+
+    const Vector3F measurement_residual = measurement - muHat;
+    state.gyr_bias_correction =
+        heapVars.A12.mul_transpose(measurement_residual) * gain_gyr_bias;
+    state.acc_bias_correction =
+        heapVars.A13.mul_transpose(measurement_residual) * gain_acc_bias;
+
+    // Finite-step safeguard for the isolated bias-gradient update. Avoid a
+    // 6x6 eigenvalue calculation onboard by using the conservative bound
+    // lambda_max <= k_bg ||H M_g||_F^2 + k_ba ||H M_a||_F^2.
+    const ftype gyr_sensor_sensitivity_sq =
+        heapVars.A12.a.length_squared()
+        + heapVars.A12.b.length_squared()
+        + heapVars.A12.c.length_squared();
+    const ftype acc_sensor_sensitivity_sq =
+        heapVars.A13.a.length_squared()
+        + heapVars.A13.b.length_squared()
+        + heapVars.A13.c.length_squared();
+
+    const ftype bias_lambda_bound =
+        gain_gyr_bias * gyr_sensor_sensitivity_sq
+        + gain_acc_bias * acc_sensor_sensitivity_sq;
+
+    constexpr ftype bias_rho = 0.5;
+    ftype h_bias = h;
+    if (bias_lambda_bound > 1.0e-12) {
+        h_bias = MIN(h_bias, (2.0 * bias_rho) / bias_lambda_bound);
+    }
+
+    saturate_bias(state.gyr_bias_correction, state.gyr_bias,
+                  gains.sat_gyr_bias.get(), h_bias);
+    saturate_bias(state.acc_bias_correction, state.acc_bias,
+                  gains.sat_acc_bias.get(), h_bias);
+
+    // Finite-map counterpart of the continuous M^+=(A-KC)M update. A_f is
+    // induced by the actual finite auxiliary factor B; K_f uses the actual
+    // finite translation coefficient lambda.
+    heapVars.A11 = heapVars.I3;
+    heapVars.A12.zero();
+    heapVars.A13.zero();
+    heapVars.A21 = -Matrix3F::skew_symmetric(U1);
+    heapVars.A22 = heapVars.I3 * A_step.a11();
+    heapVars.A23 = heapVars.I3 * A_step.a21();
+    heapVars.A31 = -Matrix3F::skew_symmetric(U2);
+    heapVars.A32 = heapVars.I3 * A_step.a12();
+    heapVars.A33 = heapVars.I3 * A_step.a22();
+
+    heapVars.K11 = Matrix3F::skew_symmetric(b) * (4.0 * gain_R * h);
+    heapVars.K21 = heapVars.I3 * (lambda * c.x);
+    heapVars.K31 = heapVars.I3 * (lambda * c.y);
+
+    state.gyr_bias_gain_mat.rot = (heapVars.A11 - heapVars.K11 * heapVars.C11) * heapVars.M1Gyr;
+    state.gyr_bias_gain_mat.vel = (heapVars.A21 - heapVars.K21 * heapVars.C11) * heapVars.M1Gyr;
+    state.gyr_bias_gain_mat.pos = (heapVars.A31 - heapVars.K31 * heapVars.C11) * heapVars.M1Gyr;
+    state.acc_bias_gain_mat.rot = (heapVars.A11 - heapVars.K11 * heapVars.C11) * heapVars.M1Acc;
+    state.acc_bias_gain_mat.vel = (heapVars.A21 - heapVars.K21 * heapVars.C11) * heapVars.M1Acc;
+    state.acc_bias_gain_mat.pos = (heapVars.A31 - heapVars.K31 * heapVars.C11) * heapVars.M1Acc;
+
+    state.gyr_bias_gain_mat.rot += (heapVars.A12 - heapVars.K11 * heapVars.C12) * heapVars.M2Gyr;
+    state.gyr_bias_gain_mat.vel += (heapVars.A22 - heapVars.K21 * heapVars.C12) * heapVars.M2Gyr;
+    state.gyr_bias_gain_mat.pos += (heapVars.A32 - heapVars.K31 * heapVars.C12) * heapVars.M2Gyr;
+    state.acc_bias_gain_mat.rot += (heapVars.A12 - heapVars.K11 * heapVars.C12) * heapVars.M2Acc;
+    state.acc_bias_gain_mat.vel += (heapVars.A22 - heapVars.K21 * heapVars.C12) * heapVars.M2Acc;
+    state.acc_bias_gain_mat.pos += (heapVars.A32 - heapVars.K31 * heapVars.C12) * heapVars.M2Acc;
+
+    state.gyr_bias_gain_mat.rot += (heapVars.A13 - heapVars.K11 * heapVars.C13) * heapVars.M3Gyr;
+    state.gyr_bias_gain_mat.vel += (heapVars.A23 - heapVars.K21 * heapVars.C13) * heapVars.M3Gyr;
+    state.gyr_bias_gain_mat.pos += (heapVars.A33 - heapVars.K31 * heapVars.C13) * heapVars.M3Gyr;
+    state.acc_bias_gain_mat.rot += (heapVars.A13 - heapVars.K11 * heapVars.C13) * heapVars.M3Acc;
+    state.acc_bias_gain_mat.vel += (heapVars.A23 - heapVars.K21 * heapVars.C13) * heapVars.M3Acc;
+    state.acc_bias_gain_mat.pos += (heapVars.A33 - heapVars.K31 * heapVars.C13) * heapVars.M3Acc;
+
 	const SIM23 correction =
         Z_before * D * ZInv;
 
@@ -1393,6 +2304,37 @@ ftype AP_CINS::update_vector_measurement_discrete(
     state.ZHat =
         Z_before * B;
 
+    // Pair the bias-state jump with the post-map sensitivity M^+. This mirrors
+    // the continuous observer's M^+ delta_b injection but uses the finite-map
+    // sensitivity transition above.
+    heapVars.Omega_Delta =
+        (state.gyr_bias_gain_mat.rot * state.gyr_bias_correction
+         + state.acc_bias_gain_mat.rot * state.acc_bias_correction) * h_bias;
+    heapVars.W_Delta1 =
+        (state.gyr_bias_gain_mat.vel * state.gyr_bias_correction
+         + state.acc_bias_gain_mat.vel * state.acc_bias_correction) * h_bias;
+    heapVars.W_Delta2 =
+        (state.gyr_bias_gain_mat.pos * state.gyr_bias_correction
+         + state.acc_bias_gain_mat.pos * state.acc_bias_correction) * h_bias;
+
+    heapVars.Delta_SIM23 = SIM23(
+        Matrix3F::from_angular_velocity(heapVars.Omega_Delta),
+        heapVars.W_Delta1,
+        heapVars.W_Delta2,
+        GL2::identity());
+    heapVars.ZInv = state.ZHat.inverse();
+    heapVars.Delta_SIM23 =
+        state.ZHat * heapVars.Delta_SIM23 * heapVars.ZInv;
+
+    state.XHat = Gal3F(
+        heapVars.Delta_SIM23.R(),
+        heapVars.Delta_SIM23.W2(),
+        heapVars.Delta_SIM23.W1(),
+        0.0) * state.XHat;
+
+    state.gyr_bias += state.gyr_bias_correction * h_bias;
+    state.acc_bias += state.acc_bias_correction * h_bias;
+
     return measurementErrorSq;
 }
 
@@ -1400,6 +2342,8 @@ ftype AP_CINS::update_attitude_measurement_discrete(
     const Vector3F &measurement,
     const Vector3F &reference,
     const ftype &gain_R,
+    const ftype &gain_gyr_bias,
+    const ftype &gain_acc_bias,
     const ftype h_requested)
 {
     // Attitude-only measurement:
@@ -1421,7 +2365,15 @@ ftype AP_CINS::update_attitude_measurement_discrete(
     const ftype measurementErrorSq =
         (measurement - muHat).length_squared();
 
-    if (!is_positive(gain_R) || !is_positive(h_requested)) {
+    const bool attitude_update_enabled = is_positive(gain_R);
+    const bool bias_update_enabled =
+        is_positive(gain_gyr_bias) || is_positive(gain_acc_bias);
+
+    // Allow a bias-only magnetometer update (for example MGATT=0, MAGGB>0).
+    // This mirrors the continuous observer, where magnetometer bias adaptation
+    // does not require a nonzero direct attitude gain.
+    if (!is_positive(h_requested) ||
+        (!attitude_update_enabled && !bias_update_enabled)) {
         return measurementErrorSq;
     }
 
@@ -1481,6 +2433,60 @@ ftype AP_CINS::update_attitude_measurement_discrete(
         return measurementErrorSq;
     }
 
+    // ---------------------------------------------------------------------
+    // Bias-augmented finite attitude map
+    // ---------------------------------------------------------------------
+    // Snapshot M^- before the native magnetometer jump. For C=0 the
+    // measurement Jacobian contains only C11, but both gyro- and accel-bias
+    // sensitivities may contribute through their attitude blocks.
+    heapVars.M1Gyr = state.gyr_bias_gain_mat.rot;
+    heapVars.M2Gyr = state.gyr_bias_gain_mat.vel;
+    heapVars.M3Gyr = state.gyr_bias_gain_mat.pos;
+    heapVars.M1Acc = state.acc_bias_gain_mat.rot;
+    heapVars.M2Acc = state.acc_bias_gain_mat.vel;
+    heapVars.M3Acc = state.acc_bias_gain_mat.pos;
+
+    // For the attitude-only measurement, ref_base=0 and mu_Z=0, hence
+    // C11 = -skew(muHat) R_Z and C12=C13=0.
+    heapVars.C11 =
+        -Matrix3F::skew_symmetric(muHat) * Z_before.R();
+
+    // Reuse heap scratch matrices for H M_g and H M_a.
+    heapVars.A12 = heapVars.C11 * heapVars.M1Gyr;
+    heapVars.A13 = heapVars.C11 * heapVars.M1Acc;
+
+    const Vector3F measurement_residual = measurement - muHat;
+    state.gyr_bias_correction =
+        heapVars.A12.mul_transpose(measurement_residual) * gain_gyr_bias;
+    state.acc_bias_correction =
+        heapVars.A13.mul_transpose(measurement_residual) * gain_acc_bias;
+
+    // Same conservative finite bias-step bound used by the finite GPS maps:
+    // lambda_max <= k_bg ||H M_g||_F^2 + k_ba ||H M_a||_F^2.
+    const ftype gyr_sensor_sensitivity_sq =
+        heapVars.A12.a.length_squared()
+        + heapVars.A12.b.length_squared()
+        + heapVars.A12.c.length_squared();
+    const ftype acc_sensor_sensitivity_sq =
+        heapVars.A13.a.length_squared()
+        + heapVars.A13.b.length_squared()
+        + heapVars.A13.c.length_squared();
+
+    const ftype bias_lambda_bound =
+        gain_gyr_bias * gyr_sensor_sensitivity_sq
+        + gain_acc_bias * acc_sensor_sensitivity_sq;
+
+    constexpr ftype bias_rho = 0.5;
+    ftype h_bias = h;
+    if (bias_lambda_bound > 1.0e-12) {
+        h_bias = MIN(h_bias, (2.0 * bias_rho) / bias_lambda_bound);
+    }
+
+    saturate_bias(state.gyr_bias_correction, state.gyr_bias,
+                  gains.sat_gyr_bias.get(), h_bias);
+    saturate_bias(state.acc_bias_correction, state.acc_bias,
+                  gains.sat_acc_bias.get(), h_bias);
+
 #if HAL_LOGGING_ENABLED
     if (detail_log_rate.get() > 0) {
         // Reuse CIDU:
@@ -1515,6 +2521,21 @@ ftype AP_CINS::update_attitude_measurement_discrete(
         heapVars.zero_vector,
         GL2::identity());
 
+    // Finite attitude-map sensitivity transition. Since C=0 gives B=I,
+    // the lower translation rows are unchanged. The attitude block is the
+    // finite counterpart of the continuous (I-K11*C11) update. This remains
+    // the identity when MGATT=0, allowing a pure bias-adaptation event.
+    heapVars.K11 =
+        Matrix3F::skew_symmetric(b) * (4.0 * gain_R * h);
+    heapVars.A11 = heapVars.I3 - heapVars.K11 * heapVars.C11;
+
+    state.gyr_bias_gain_mat.rot = heapVars.A11 * heapVars.M1Gyr;
+    state.gyr_bias_gain_mat.vel = heapVars.M2Gyr;
+    state.gyr_bias_gain_mat.pos = heapVars.M3Gyr;
+    state.acc_bias_gain_mat.rot = heapVars.A11 * heapVars.M1Acc;
+    state.acc_bias_gain_mat.vel = heapVars.M2Acc;
+    state.acc_bias_gain_mat.pos = heapVars.M3Acc;
+
     // Apply the exact finite group action:
     //
     // XHat+ = Z D Z^-1 XHat
@@ -1537,6 +2558,36 @@ ftype AP_CINS::update_attitude_measurement_discrete(
 
 	state.XHat =
 		correction_gal * state.XHat;
+
+    // Pair the bias-state jump with the post-map sensitivity M^+. ZHat is
+    // unchanged by the attitude-only native map, so use the same Z frame for
+    // the conjugated navigation correction.
+    heapVars.Omega_Delta =
+        (state.gyr_bias_gain_mat.rot * state.gyr_bias_correction
+         + state.acc_bias_gain_mat.rot * state.acc_bias_correction) * h_bias;
+    heapVars.W_Delta1 =
+        (state.gyr_bias_gain_mat.vel * state.gyr_bias_correction
+         + state.acc_bias_gain_mat.vel * state.acc_bias_correction) * h_bias;
+    heapVars.W_Delta2 =
+        (state.gyr_bias_gain_mat.pos * state.gyr_bias_correction
+         + state.acc_bias_gain_mat.pos * state.acc_bias_correction) * h_bias;
+
+    heapVars.Delta_SIM23 = SIM23(
+        Matrix3F::from_angular_velocity(heapVars.Omega_Delta),
+        heapVars.W_Delta1,
+        heapVars.W_Delta2,
+        GL2::identity());
+    heapVars.Delta_SIM23 =
+        Z_before * heapVars.Delta_SIM23 * ZInv;
+
+    state.XHat = Gal3F(
+        heapVars.Delta_SIM23.R(),
+        heapVars.Delta_SIM23.W2(),
+        heapVars.Delta_SIM23.W1(),
+        0.0) * state.XHat;
+
+    state.gyr_bias += state.gyr_bias_correction * h_bias;
+    state.acc_bias += state.acc_bias_correction * h_bias;
 
 	const Vector3F delta_vel =
 		state.XHat.vel() - vel_before;
@@ -1618,6 +2669,10 @@ void AP_CINS::update_Kq_discrete(const ftype h)
         heapVars.zero_vector,
         Hq);
 
+    // Keep the bias sensitivity in the coordinates induced by the same exact
+    // finite Kq right action applied to ZHat.
+    compute_bias_update_imu(Bq.inverse());
+
     state.ZHat =
         state.ZHat * Bq;
 }
@@ -1627,12 +2682,36 @@ void AP_CINS::update_Kq_discrete(const ftype h)
  */
 bool AP_CINS::init_yaw(void)
 {
-    ftype mag_yaw, dt;
-    if (!get_compass_yaw(mag_yaw, dt)) {
+    // CINS starts with XHat = identity(), so its roll/pitch are not yet usable
+    // for compass tilt compensation. Initialise roll and pitch from the
+    // stationary accelerometer first, then compute magnetic yaw using that
+    // explicit attitude.
+    auto &dal = AP::dal();
+    const auto &ins = dal.ins();
+
+    const uint8_t accel_idx = ins.get_first_usable_accel();
+    const Vector3f accel = ins.get_accel(accel_idx);
+    const float accel_norm = accel.length();
+
+    // Only initialise attitude when the measured acceleration is close to 1 g.
+    // This avoids treating translational acceleration as vehicle tilt.
+    if (!isfinite(accel_norm) || accel_norm < 9.0f || accel_norm > 11.0f) {
         return false;
     }
-    ftype roll_rad, pitch_rad, yaw_rad;
-    state.XHat.rot().to_euler(&roll_rad, &pitch_rad, &yaw_rad);
+
+    const ftype pitch_rad =
+        atan2f(accel.x, norm(accel.y, accel.z));
+    const ftype roll_rad =
+        atan2f(-accel.y, -accel.z);
+
+    Matrix3F initial_attitude;
+    initial_attitude.from_euler(roll_rad, pitch_rad, 0.0);
+
+    ftype mag_yaw, dt;
+    if (!get_compass_yaw(initial_attitude, mag_yaw, dt)) {
+        return false;
+    }
+
     state.XHat.rot().from_euler(roll_rad, pitch_rad, mag_yaw);
 
 #if HAL_LOGGING_ENABLED
@@ -1646,7 +2725,7 @@ bool AP_CINS::init_yaw(void)
 /*
   get yaw from compass
  */
-bool AP_CINS::get_compass_yaw(ftype &yaw_rad, ftype &dt)
+bool AP_CINS::get_compass_yaw(const Matrix3F &attitude, ftype &yaw_rad, ftype &dt)
 {
     auto &dal = AP::dal();
     const auto &compass = dal.compass();
@@ -1675,15 +2754,25 @@ bool AP_CINS::get_compass_yaw(ftype &yaw_rad, ftype &dt)
         return false;
     }
 
-    // const float cos_pitch_sq = 1.0f-(state.XHat.rot().c.x*state.XHat.rot().c.x);
-    // const float headY = field.y * state.XHat.rot().c.z - field.z * state.XHat.rot().c.y;
+    // Tilt-compensate the magnetic field using the explicitly supplied
+    // roll/pitch attitude. Do not use state.XHat here: during startup XHat has
+    // only just been reset and does not yet contain a valid tilt estimate.
+    const float cos_pitch_sq =
+        1.0f - attitude.c.x * attitude.c.x;
 
-    // // Tilt compensated magnetic field X component:
-    // const float headX = field.x * cos_pitch_sq - state.XHat.rot().c.x * (field.y * state.XHat.rot().c.y + field.z * state.XHat.rot().c.z);
+    const float headY =
+        field.y * attitude.c.z - field.z * attitude.c.y;
 
-    // return magnetic yaw
+    // Tilt-compensated magnetic field X component.
+    const float headX =
+        field.x * cos_pitch_sq
+        - attitude.c.x *
+            (field.y * attitude.c.y + field.z * attitude.c.z);
 
-    yaw_rad = wrap_PI(-atan2f(field.y,field.x) + declination_rad);
+    const float heading =
+        constrain_float(atan2f(-headY, headX), -M_PI, M_PI);
+
+    yaw_rad = wrap_PI(heading + declination_rad);
 
     return true;
 }
@@ -1738,7 +2827,7 @@ void AP_CINS::update_attitude_from_compass()
 
     ftype magErrorSq;
 
-	if (gains.gps_correction_mode.get() == 2) {
+	if (gps_correction_mode() == 2) {
 
 		// Finite event-based magnetometer correction.
 		// get_compass_vector() already ensures this only runs
@@ -1748,6 +2837,8 @@ void AP_CINS::update_attitude_from_compass()
 				mag_ref,
 				mag_vec,
 				gains.mag_att.get(),
+				gains.mag_gyr_bias.get(),
+				gains.mag_acc_bias.get(),
 				dt);
 
 	} else {

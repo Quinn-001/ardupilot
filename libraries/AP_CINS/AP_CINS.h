@@ -11,6 +11,8 @@
 #include <AP_Math/AP_Math.h>
 #include <AP_Math/LieGroups.h>
 #include <AP_Common/Location.h>
+#include "AP_CINS_BaroBias.h"
+#include "AP_CINS_BaroDatum.h"
 
 #ifndef CINS_MAX_HISTORY
 #define CINS_MAX_HISTORY 100
@@ -67,9 +69,23 @@ public:
     AP_Int8 memory_log_rate;
     struct {
         AP_Int8 mode;
+        AP_Int8 ct_gate;
+        AP_Int8 bias_mode;
+        AP_Int8 source_policy;
+        AP_Float bias_tc;
+        AP_Float bias_rate;
+        AP_Float bias_limit;
+        AP_Float bias_vacc;
+        AP_Float bias_sacc;
+        AP_Float bias_jump;
+        AP_Float bias_dwell;
         AP_Float lag;
         AP_Float max_age;
         AP_Float gate;
+        AP_Float innovation_gate;
+        AP_Float ground_effect_gate;
+        AP_Float failure_time;
+        AP_Float transition_rate;
     } baro_config;
 
     Vector3f get_accel() const
@@ -114,6 +130,10 @@ public:
     // buffer and thread. Compass calibration requires a reboot, so history is
     // rebuilt only on the next boot.
     void prepare_for_compass_calibration(void);
+    bool pre_arm_check(char *failure_msg, uint8_t failure_msg_len) const;
+    bool prepare_for_arming(bool required, char *failure_msg, uint8_t failure_msg_len);
+    void cancel_arming_preparation();
+    bool arming_reference_prepared() const;
     bool get_origin(Location &loc)
     {
         loc = state.origin;
@@ -125,23 +145,82 @@ public:
     static const struct AP_Param::GroupInfo var_info[];
 
 private:
+    enum class BaroCandidateResult : uint8_t {
+        Accepted = 0,
+        Disabled = 1,
+        Unhealthy = 2,
+        NoHistory = 3,
+        Configuration = 4,
+        Timing = 5,
+        Nonfinite = 6,
+        Aligning = 7,
+        OffsetInvalid = 8,
+        Consistency = 9,
+        DatumUnavailable = 10,
+    };
+
+    enum class HeightSource : uint8_t {
+        Baro = 0,
+        GpsTransition = 1,
+        Gps = 2,
+        GpsStartup = 3,
+    };
+
     void update_imu(const Vector3F &gyro_rads, const Vector3F &accel_mss, const ftype dt);
-    void update_gps(const Vector3F &pos, const Vector3F &vel, const ftype gps_dt);
+    void update_gps(const Vector3F &gps_pos, const Vector3F &vel, const ftype gps_dt,
+                    BaroCandidateResult baro_result, const ftype baro_down,
+                    const bool ground_effect_expected);
     ftype update_vector_measurement_cts(const Vector3F &measurement, const Vector3F& reference, const Vector2F &ref_base, const ftype& gain_R, const ftype& gain_V, const ftype& gain_gyr_bias, const ftype& gain_acc_bias, const ftype dt);
-    ftype update_vector_measurement_discrete(const Vector3F &measurement,const Vector3F &reference,const Vector2F &ref_base,const ftype &gain_R,const ftype &gain_V,const ftype h_requested,const uint8_t update_kind);
+    ftype update_vector_measurement_discrete(
+        const Vector3F &measurement,
+        const Vector3F &reference,
+        const Vector2F &ref_base,
+        const ftype &gain_R,
+        const ftype &gain_V,
+        const ftype &gain_gyr_bias,
+        const ftype &gain_acc_bias,
+        const ftype h_requested,
+        const uint8_t update_kind);
 	ftype update_attitude_measurement_discrete(
     const Vector3F &measurement,
     const Vector3F &reference,
     const ftype &gain_R,
+    const ftype &gain_gyr_bias,
+    const ftype &gain_acc_bias,
     const ftype h_requested);
 	void update_Kq_discrete(const ftype h);
 	void update_attitude_from_compass();
     bool init_yaw(void);
-    bool get_compass_yaw(ftype &yaw_rad, ftype &dt);
+    bool get_compass_yaw(const Matrix3F &attitude, ftype &yaw_rad, ftype &dt);
     bool get_compass_vector(Vector3F &mag_vec, Vector3F &mag_ref, ftype &dt);
     void update_baro_history();
+    CINSBaroDatum::Config baro_datum_config() const;
+    CINSBaroDatum::Config raw_baro_datum_config() const;
+    int8_t baro_mode() const { return last_soft_armed ? flight_baro_config.mode : baro_config.mode.get(); }
+    int8_t gps_correction_mode() const {
+        return last_soft_armed ? flight_baro_config.gps_mode : gains.gps_correction_mode.get();
+    }
+    float get_gps_lag() const { return last_soft_armed ? flight_baro_config.gps_lag : gains.gps_lag.get(); }
+    bool baro_datum_check(char *failure_msg, uint8_t failure_msg_len) const;
+    void update_baro_arming();
+    void write_baro_datum_diagnostic() const;
     void reset_baro_composite();
-    bool apply_baro_composite(Vector3F &gps_pos, uint32_t gps_timestamp_ms);
+    void reset_baro_history();
+    void reset_baro_source();
+    void update_baro_bias();
+    void update_gps_height_transition(ftype gps_dt);
+    BaroCandidateResult get_baro_candidate(const Vector3F &gps_pos,
+                                           uint32_t gps_timestamp_ms,
+                                           ftype &baro_down);
+    void update_baro_source_ct(const Vector3F &gps_pos, const ftype gps_dt);
+    void write_baro_source_diagnostic(const ftype gps_down, const ftype baro_down,
+                                      const ftype innovation_down, const ftype used_down,
+                                      const ftype bad_time, const bool ground_effect_expected,
+                                      const bool position_valid) const;
+    void write_baro_innovation_diagnostic(const ftype predicted_down,
+                                          const ftype baro_innovation_down,
+                                          const ftype gps_innovation_down,
+                                          const ftype current_lag) const;
 
     void compute_bias_update_imu(const SIM23& Gamma);
     void saturate_bias(Vector3F& bias_correction, const Vector3F& current_bias, const ftype& saturation, const ftype& dt) const;
@@ -245,9 +324,19 @@ private:
         double internal_time;
         ObjectBuffer<stamped_Gal3F> stamped_inputs{CINS_MAX_HISTORY};
         Vector3F gps_vel;
-        Vector3F gps_pos;
+        Vector3F gps_pos;      // raw GPS position for the current aiding event
+        Vector3F aiding_pos;   // position selected by the BAMOD source manager
+        ftype baro_down;
+        BaroCandidateResult baro_result;
+        uint32_t datum_generation;
+        bool baro_armed_event;
+        uint32_t bias_timestamp_ms;
+        float bias_trust;
+        bool ground_effect_expected;
+        bool position_correction_valid;
+        bool last_gps_vel_correction_applied;
+        bool last_gps_pos_correction_applied;
         Gal3F YR; // Primary right delay matrix
-        Gal3F YR_stepper; // right delay matrix to apply at new GPS measurement.
         Gal3F history_increment; // accumulated increment awaiting history storage
         uint16_t history_increment_count;
         ftype gps_correction_dt;
@@ -264,17 +353,27 @@ private:
 
     struct {
         baro_sample history[CINS_BARO_HISTORY_SIZE];
-        ftype offset;
-        ftype offset_sum;
+        uint16_t calibration_generation;
         uint32_t last_update_ms;
         uint8_t next;
         uint8_t count;
-        uint8_t offset_sample_count;
         uint8_t primary;
         bool healthy;
-        bool offset_valid;
         bool last_sample_accepted;
+        HeightSource source;
+        ftype bad_time;
+        ftype transition_offset;
+        ftype selected_down;
+        bool selected_down_valid;
     } baro_state;
+
+    CINSBaroBias baro_bias;
+    CINSBaroDatum baro_datum;
+    mutable HAL_Semaphore datum_sem;
+    bool last_soft_armed {false};
+    CINSBaroDatum::Config flight_baro_config {};
+    bool flight_config_prepared {false};
+    bool settings_change_reported {false};
 
     uint32_t last_gps_update_ms;
     uint32_t last_detail_log_ms;

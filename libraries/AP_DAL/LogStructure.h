@@ -209,9 +209,11 @@ struct log_REY3 {
 // @Description: Replay Data Barometer Header
 // @Field: Primary: primary barometer instance number
 // @Field: NumInst: number of barometer sensors
+// @Field: Cal: barometer calibration generation
 struct log_RBRH {
     uint8_t primary;
     uint8_t num_instances;
+    uint16_t calibration_generation;
     uint8_t _end;
 };
 
@@ -621,7 +623,7 @@ struct log_RTER {
     { LOG_RASI_MSG, RLOG_SIZE(RASI),                                   \
       "RASI", "fIBBB", "pd,UpdateMS,H,Use,I", "----#", "-----" }, \
     { LOG_RBRH_MSG, RLOG_SIZE(RBRH),                                   \
-      "RBRH", "BB", "Primary,NumInst", "--", "--" },  \
+      "RBRH", "BBH", "Primary,NumInst,Cal", "---", "---" },  \
     { LOG_RBRI_MSG, RLOG_SIZE(RBRI),                                   \
       "RBRI", "IfBB", "LastUpdate,Alt,H,I", "---#", "----" }, \
     { LOG_RRNH_MSG, RLOG_SIZE(RRNH),                                   \

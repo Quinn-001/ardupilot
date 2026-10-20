@@ -93,6 +93,7 @@ public:
     // update the barometer calibration to the current pressure. Can
     // be used for incremental preflight update of baro
     void update_calibration(void);
+    uint16_t get_calibration_generation() const { return _calibration_generation; }
 
     // get current altitude in meters relative to altitude at the time
     // of the last calibrate() call
@@ -248,6 +249,7 @@ private:
     uint32_t _log_baro_bit = -1;
 
     bool init_done;
+    uint16_t _calibration_generation {};
 
     uint8_t msp_instance_mask;
 

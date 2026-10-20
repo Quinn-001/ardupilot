@@ -686,7 +686,17 @@ bool AP_Arming_Copter::arm(const AP_Arming::Method method, const bool do_arming_
         return true;
     }
 
+    // Freeze prepared sensor references before home is copied from AHRS.
+    // Preparation is reversible until the existing arm transaction succeeds.
+    char datum_failure[100] {};
+    if (!AP::ahrs().prepare_for_arming(datum_failure, sizeof(datum_failure))) {
+        check_failed(true, "%s", datum_failure);
+        AP_Notify::events.arming_failed = true;
+        in_arm_motors = false;
+        return false;
+    }
     if (!AP_Arming::arm(method, do_arming_checks)) {
+        AP::ahrs().cancel_arming_preparation();
         AP_Notify::events.arming_failed = true;
         in_arm_motors = false;
         return false;
@@ -717,6 +727,25 @@ bool AP_Arming_Copter::arm(const AP_Arming::Method method, const bool do_arming_
 
     auto &ahrs = AP::ahrs();
 
+    const auto abort_reference_arm = [&](const char *reason) {
+        check_failed(true, "%s", reason);
+        AP_Arming::disarm(method, false);
+        ahrs.cancel_arming_preparation();
+#if HAL_LOGGING_ENABLED
+        AP::logger().set_vehicle_armed(false);
+#endif
+        AP_Notify::flags.armed = false;
+        AP_Notify::events.arming_failed = true;
+        copter.failsafe_enable();
+        in_arm_motors = false;
+        return false;
+    };
+    // Logger/GPS preparation may have taken time. Recheck the frozen snapshot
+    // before home capture, using the live clock, without changing the datum.
+    if (!ahrs.check_arming_reference(datum_failure, sizeof(datum_failure))) {
+        return abort_reference_arm(datum_failure);
+    }
+
     copter.initial_armed_bearing_rad = ahrs.get_yaw_rad();
 
     if (!ahrs.home_is_set()) {
@@ -729,7 +758,9 @@ bool AP_Arming_Copter::arm(const AP_Arming::Method method, const bool do_arming_
     } else if (!ahrs.home_is_locked()) {
         // Reset home position if it has already been set before (but not locked)
         if (!copter.set_home_to_current_location(false)) {
-            // ignore failure
+            if (ahrs.arming_reference_prepared()) {
+                return abort_reference_arm("CINS: unable to set home");
+            }
         }
 
         // remember the height when we armed (ignore failures)

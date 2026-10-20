@@ -276,6 +276,23 @@ bool AP_ExternalAHRS::get_speed_down(float &speedD)
     return true;
 }
 
+bool AP_ExternalAHRS::prepare_for_arming(bool required, char *failure_msg, uint8_t failure_msg_len)
+{
+    return backend == nullptr || backend->prepare_for_arming(required, failure_msg, failure_msg_len);
+}
+
+void AP_ExternalAHRS::cancel_arming_preparation()
+{
+    if (backend != nullptr) {
+        backend->cancel_arming_preparation();
+    }
+}
+
+bool AP_ExternalAHRS::arming_reference_prepared() const
+{
+    return backend != nullptr && backend->arming_reference_prepared();
+}
+
 bool AP_ExternalAHRS::pre_arm_check(char *failure_msg, uint8_t failure_msg_len) const
 {
     if (backend == nullptr) {

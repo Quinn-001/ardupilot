@@ -40,6 +40,9 @@ public:
     // The communication interface is up and the device has sent valid data.
     virtual bool initialised(void) const = 0;
     virtual bool pre_arm_check(char *failure_msg, uint8_t failure_msg_len) const = 0;
+    virtual bool prepare_for_arming(bool required, char *failure_msg, uint8_t failure_msg_len) { return true; }
+    virtual void cancel_arming_preparation() {}
+    virtual bool arming_reference_prepared() const { return false; }
     virtual void get_filter_status(nav_filter_status &status) const {}
     virtual bool get_variances(float &velVar, float &posVar, float &hgtVar, Vector3f &magVar, float &tasVar) const { return false; }
 

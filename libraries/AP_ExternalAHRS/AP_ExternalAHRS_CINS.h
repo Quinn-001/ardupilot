@@ -37,8 +37,15 @@ public:
     bool initialised(void) const override {
         return cins.initialised();
     }
-    bool pre_arm_check(char *failure_msg, uint8_t failure_msg_len) const override {
-        return true;
+    bool pre_arm_check(char *failure_msg, uint8_t failure_msg_len) const override;
+    bool prepare_for_arming(bool required, char *failure_msg, uint8_t failure_msg_len) override {
+        return cins.prepare_for_arming(required, failure_msg, failure_msg_len);
+    }
+    void cancel_arming_preparation() override {
+        cins.cancel_arming_preparation();
+    }
+    bool arming_reference_prepared() const override {
+        return cins.arming_reference_prepared();
     }
 
     void get_filter_status(nav_filter_status &status) const override;

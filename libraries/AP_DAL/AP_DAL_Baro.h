@@ -10,6 +10,9 @@ public:
     uint8_t get_primary() const {
         return _RBRH.primary;
     }
+    uint16_t get_calibration_generation() const {
+        return _RBRH.calibration_generation;
+    }
     uint8_t num_instances() const {
         return _RBRH.num_instances;
     }

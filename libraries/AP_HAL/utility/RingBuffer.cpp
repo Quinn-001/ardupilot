@@ -196,6 +196,34 @@ uint32_t ByteBuffer::peekbytes(uint8_t *data, uint32_t len)
     return ret;
 }
 
+uint32_t ByteBuffer::peekbytes_at(uint8_t *data, uint32_t len, uint32_t offset)
+{
+    const uint32_t available_bytes = available();
+    if (offset >= available_bytes) {
+        return 0;
+    }
+    if (len > available_bytes - offset) {
+        len = available_bytes - offset;
+    }
+    IoVec vec[2];
+    const uint8_t parts = peekiovec(vec, offset + len);
+    uint32_t copied = 0;
+    for (uint8_t i = 0; i < parts && copied < len; i++) {
+        if (offset >= vec[i].len) {
+            offset -= vec[i].len;
+            continue;
+        }
+        uint32_t count = vec[i].len - offset;
+        if (count > len - copied) {
+            count = len - copied;
+        }
+        memcpy(data + copied, vec[i].data + offset, count);
+        copied += count;
+        offset = 0;
+    }
+    return copied;
+}
+
 uint8_t ByteBuffer::reserve(ByteBuffer::IoVec iovec[2], uint32_t len)
 {
     uint32_t n = space();

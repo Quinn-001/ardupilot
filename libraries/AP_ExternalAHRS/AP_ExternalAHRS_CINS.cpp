@@ -20,6 +20,7 @@
 #if AP_EXTERNAL_AHRS_CINS_ENABLED
 
 #include "AP_ExternalAHRS_CINS.h"
+#include <AP_AHRS/AP_AHRS.h>
 #include <GCS_MAVLink/GCS.h>
 
 AP_ExternalAHRS_CINS::AP_ExternalAHRS_CINS(AP_ExternalAHRS *_frontend,
@@ -38,6 +39,16 @@ AP_ExternalAHRS_CINS::AP_ExternalAHRS_CINS(AP_ExternalAHRS *_frontend,
 
     // CINS does not provide new sensors, only a state estimate
     set_default_sensors(0);
+}
+
+bool AP_ExternalAHRS_CINS::pre_arm_check(char *failure_msg, uint8_t failure_msg_len) const
+{
+#if AP_AHRS_EXTERNAL_ENABLED
+    if (AP::ahrs().configured_ekf_type() == AP_AHRS::EKFType::EXTERNAL) {
+        return cins.pre_arm_check(failure_msg, failure_msg_len);
+    }
+#endif
+    return true;
 }
 
 void AP_ExternalAHRS_CINS::update(void)

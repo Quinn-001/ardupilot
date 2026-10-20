@@ -2927,6 +2927,53 @@ uint32_t AP_AHRS::getLastPosDownReset(float &posDelta)
     return 0;
 }
 
+bool AP_AHRS::prepare_for_arming(char *failure_msg, uint8_t failure_msg_len)
+{
+    WITH_SEMAPHORE(_rsem);
+#if AP_AHRS_EXTERNAL_ENABLED
+    auto &eahrs = AP::externalAHRS();
+    const bool required = configured_ekf_type() == EKFType::EXTERNAL;
+    if (!eahrs.prepare_for_arming(required, failure_msg, failure_msg_len)) {
+        return false;
+    }
+    if (required && eahrs.arming_reference_prepared() && !home_is_set()) {
+        eahrs.cancel_arming_preparation();
+        hal.util->snprintf(failure_msg, failure_msg_len, "CINS: waiting for initial home");
+        return false;
+    }
+    return true;
+#else
+    return true;
+#endif
+}
+
+void AP_AHRS::cancel_arming_preparation()
+{
+    WITH_SEMAPHORE(_rsem);
+#if AP_AHRS_EXTERNAL_ENABLED
+    AP::externalAHRS().cancel_arming_preparation();
+#endif
+}
+
+bool AP_AHRS::arming_reference_prepared() const
+{
+#if AP_AHRS_EXTERNAL_ENABLED
+    return configured_ekf_type() == EKFType::EXTERNAL && AP::externalAHRS().arming_reference_prepared();
+#else
+    return false;
+#endif
+}
+
+bool AP_AHRS::check_arming_reference(char *failure_msg, uint8_t failure_msg_len) const
+{
+#if AP_AHRS_EXTERNAL_ENABLED
+    if (arming_reference_prepared()) {
+        return AP::externalAHRS().pre_arm_check(failure_msg, failure_msg_len);
+    }
+#endif
+    return true;
+}
+
 // Resets the baro so that it reads zero at the current height
 // Resets the EKF height to zero
 // Adjusts the EKf origin height so that the EKF height + origin height is the same as before

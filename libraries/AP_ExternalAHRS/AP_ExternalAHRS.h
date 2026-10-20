@@ -124,6 +124,9 @@ public:
     bool get_velocity_NED(Vector3f &vel);
     bool get_speed_down(float &speedD);
     bool pre_arm_check(char *failure_msg, uint8_t failure_msg_len) const;
+    bool prepare_for_arming(bool required, char *failure_msg, uint8_t failure_msg_len);
+    void cancel_arming_preparation();
+    bool arming_reference_prepared() const;
     void get_filter_status(nav_filter_status &status) const;
     bool get_gyro(Vector3f &gyro);
     bool get_accel(Vector3f &accel);

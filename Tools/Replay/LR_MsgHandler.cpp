@@ -201,7 +201,12 @@ void LR_MsgHandler_RASI::process_message(uint8_t *msgbytes)
 
 void LR_MsgHandler_RBRH::process_message(uint8_t *msgbytes)
 {
-    MSG_CREATE(RBRH, msgbytes);
+    // Older RBRH records have no calibration generation. Parse by label to
+    // avoid reading beyond their payload or changing the legacy field offsets.
+    log_RBRH msg {};
+    require_field(msgbytes, "Primary", msg.primary);
+    require_field(msgbytes, "NumInst", msg.num_instances);
+    field_value(msgbytes, "Cal", msg.calibration_generation);
     AP::dal().handle_message(msg);
 }
 

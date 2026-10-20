@@ -340,6 +340,10 @@ public:
     // returns false if we fail arming checks, in which case the buffer will be populated with a failure message
     // requires_position should be true if horizontal position configuration should be checked
     bool pre_arm_check(bool requires_position, char *failure_msg, uint8_t failure_msg_len) const;
+    bool prepare_for_arming(char *failure_msg, uint8_t failure_msg_len);
+    void cancel_arming_preparation();
+    bool arming_reference_prepared() const;
+    bool check_arming_reference(char *failure_msg, uint8_t failure_msg_len) const;
 
     // true if the AHRS has completed initialisation
     bool initialised() const;
